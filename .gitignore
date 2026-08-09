@@ -1,0 +1,17 @@
+node_modules/
+.DS_Store
+*.log
+
+# Local scratch
+.tmp/
+tmp/
+
+# Toolkit checkout path used by reusable workflows at runtime
+.toolkit/
+
+# Never commit real credentials
+*.pem
+*.key
+.env
+.env.*
+!.env.example
