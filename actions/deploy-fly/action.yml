@@ -1,0 +1,191 @@
+# Deploy an app to Fly.io with flyctl.
+#
+# Two things this handles that a bare `flyctl deploy` doesn't:
+#
+#   • Secrets. `secrets:` is a newline-separated KEY=value block that is staged with
+#     `flyctl secrets set --stage` *before* the deploy, so the new machines boot with the
+#     new values in one release instead of two (a plain `secrets set` triggers its own
+#     restart, deploying the previous image with the new secrets first).
+#   • Ephemeral PR apps. `app-suffix` plus `create-if-missing` gives every PR its own app
+#     (`myapp-pr-42`), and `deploy-fly` cleans up nothing — pair it with a `closed`-event
+#     job calling `flyctl apps destroy`.
+#
+# Set `image` to deploy a pre-built image (the right pattern when a build job already
+# pushed one), or leave it empty to build from the Dockerfile via Fly's remote builder.
+
+name: Deploy to Fly.io
+description: Deploy an app to Fly.io, optionally creating it and staging secrets first
+
+inputs:
+  fly-api-token:
+    description: Fly API token (`flyctl tokens create deploy`). Prefer a deploy-scoped token.
+    required: true
+  app:
+    description: Fly app name. Empty reads `app` from the config file.
+    required: false
+    default: ''
+  app-suffix:
+    description: 'Appended to the app name, e.g. `-pr-42` for per-PR apps.'
+    required: false
+    default: ''
+  config:
+    description: Path to the Fly config file.
+    required: false
+    default: 'fly.toml'
+  working-directory:
+    description: Directory to run flyctl from.
+    required: false
+    default: '.'
+  image:
+    description: Pre-built image reference to deploy. Empty builds from the Dockerfile.
+    required: false
+    default: ''
+  strategy:
+    description: 'immediate | rolling | bluegreen | canary'
+    required: false
+    default: 'rolling'
+  region:
+    description: Primary region for a newly created app.
+    required: false
+    default: ''
+  org:
+    description: Fly organization for a newly created app.
+    required: false
+    default: 'personal'
+  create-if-missing:
+    description: 'true to `flyctl apps create` when the app does not exist yet.'
+    required: false
+    default: 'false'
+  secrets:
+    description: |
+      Newline-separated `KEY=value` secrets staged before the deploy so they land in the
+      same release. Pass real secret values from `secrets.*`; they are never echoed.
+    required: false
+    default: ''
+  build-args:
+    description: Newline-separated `KEY=value` build arguments for a remote build.
+    required: false
+    default: ''
+  wait-timeout:
+    description: Seconds to wait for the release to become healthy.
+    required: false
+    default: '300'
+  deploy-args:
+    description: Extra args appended to `flyctl deploy`.
+    required: false
+    default: ''
+  flyctl-version:
+    description: flyctl version to install.
+    required: false
+    default: 'latest'
+
+outputs:
+  app:
+    description: The resolved app name.
+    value: ${{ steps.deploy.outputs.app }}
+  url:
+    description: 'The app URL (`https://<app>.fly.dev`).'
+    value: ${{ steps.deploy.outputs.url }}
+  created:
+    description: '`true` if the app was created by this run.'
+    value: ${{ steps.deploy.outputs.created }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install flyctl
+      uses: superfly/flyctl-actions/setup-flyctl@master
+      with:
+        version: ${{ inputs.flyctl-version }}
+
+    - name: Deploy
+      id: deploy
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        FLY_API_TOKEN: ${{ inputs.fly-api-token }}
+        IN_APP: ${{ inputs.app }}
+        APP_SUFFIX: ${{ inputs.app-suffix }}
+        CONFIG: ${{ inputs.config }}
+        IMAGE: ${{ inputs.image }}
+        STRATEGY: ${{ inputs.strategy }}
+        REGION: ${{ inputs.region }}
+        ORG: ${{ inputs.org }}
+        CREATE_IF_MISSING: ${{ inputs.create-if-missing }}
+        FLY_SECRETS: ${{ inputs.secrets }}
+        BUILD_ARGS: ${{ inputs.build-args }}
+        WAIT_TIMEOUT: ${{ inputs.wait-timeout }}
+        DEPLOY_ARGS: ${{ inputs.deploy-args }}
+      run: |
+        set -euo pipefail
+
+        # ── Resolve the app name ─────────────────────────────────────────────────
+        app="$IN_APP"
+        if [ -z "$app" ]; then
+          if [ ! -f "$CONFIG" ]; then
+            echo "::error::No app name given and config file '$CONFIG' does not exist."
+            exit 1
+          fi
+          app="$(grep -m1 -E '^\s*app\s*=' "$CONFIG" | sed -E 's/.*=\s*"?([^"]+)"?.*/\1/' | tr -d '[:space:]')"
+        fi
+        app="${app}${APP_SUFFIX}"
+        if [ -z "$app" ]; then
+          echo "::error::Could not determine the Fly app name."
+          exit 1
+        fi
+        echo "App: $app"
+
+        # ── Create it if asked and it isn't there ────────────────────────────────
+        created=false
+        if ! flyctl status --app "$app" >/dev/null 2>&1; then
+          if [ "$CREATE_IF_MISSING" != "true" ]; then
+            echo "::error::App '$app' does not exist. Set create-if-missing: true to create it."
+            exit 1
+          fi
+          create_args=(apps create "$app" --org "$ORG")
+          flyctl "${create_args[@]}"
+          created=true
+          echo "Created app $app"
+        fi
+
+        # ── Stage secrets so they ship with this release, not before it ──────────
+        if [ -n "$FLY_SECRETS" ]; then
+          secret_args=()
+          while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            case "$line" in \#*) continue ;; esac
+            secret_args+=("$line")
+            echo "Staging secret: ${line%%=*}"
+          done <<< "$FLY_SECRETS"
+          if [ "${#secret_args[@]}" -gt 0 ]; then
+            flyctl secrets set --app "$app" --stage "${secret_args[@]}"
+          fi
+        fi
+
+        # ── Deploy ───────────────────────────────────────────────────────────────
+        args=(deploy --app "$app" --strategy "$STRATEGY" --wait-timeout "$WAIT_TIMEOUT")
+        [ -f "$CONFIG" ] && args+=(--config "$CONFIG")
+        [ -n "$REGION" ] && args+=(--regions "$REGION")
+
+        if [ -n "$IMAGE" ]; then
+          args+=(--image "$IMAGE")
+        else
+          args+=(--remote-only)
+          if [ -n "$BUILD_ARGS" ]; then
+            while IFS= read -r line; do
+              [ -n "$line" ] || continue
+              case "$line" in \#*) continue ;; esac
+              args+=(--build-arg "$line")
+            done <<< "$BUILD_ARGS"
+          fi
+        fi
+
+        # shellcheck disable=SC2086
+        flyctl "${args[@]}" $DEPLOY_ARGS
+
+        {
+          echo "app=$app"
+          echo "url=https://${app}.fly.dev"
+          echo "created=$created"
+        } >> "$GITHUB_OUTPUT"
+        echo "Deployed https://${app}.fly.dev"

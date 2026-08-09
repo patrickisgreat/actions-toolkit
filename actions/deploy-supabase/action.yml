@@ -1,0 +1,242 @@
+# Push migrations, Edge Functions, and project config to a Supabase project.
+#
+# Covers the three things a Supabase deploy actually consists of, each independently
+# switchable so the same action serves "migrations only" preview environments and full
+# production releases:
+#
+#   • `migrate`   — `supabase db push`, applying anything in supabase/migrations not yet
+#                   recorded in the remote schema_migrations table.
+#   • `functions` — `supabase functions deploy`, either a named list or every function.
+#   • `config`    — `supabase config push`, syncing supabase/config.toml (auth providers,
+#                   API settings) to the remote project.
+#
+# Migrations run before functions on purpose: a function deployed against a schema that
+# hasn't been migrated yet fails at runtime, whereas the reverse ordering is safe for
+# additive migrations.
+#
+# `dry-run` runs `db push --dry-run` and skips every mutating step, which makes this action
+# usable as a PR check that shows what a merge would apply.
+
+name: Deploy to Supabase
+description: Apply migrations, deploy Edge Functions, and push config to a Supabase project
+
+inputs:
+  access-token:
+    description: Supabase access token (`SUPABASE_ACCESS_TOKEN`, from Account → Access Tokens).
+    required: true
+  project-ref:
+    description: Target project ref (the subdomain in your project URL).
+    required: true
+  db-password:
+    description: Database password, required for `db push`.
+    required: false
+    default: ''
+  migrate:
+    description: 'true to run `supabase db push`.'
+    required: false
+    default: 'true'
+  functions:
+    description: |
+      Edge Functions to deploy: `all`, a comma-separated list of names, or empty to skip.
+    required: false
+    default: ''
+  function-secrets:
+    description: |
+      Newline-separated `KEY=value` secrets set on the project before functions deploy.
+    required: false
+    default: ''
+  no-verify-jwt:
+    description: 'true to deploy functions with JWT verification disabled (public webhooks).'
+    required: false
+    default: 'false'
+  config:
+    description: 'true to run `supabase config push`.'
+    required: false
+    default: 'false'
+  seed:
+    description: Path to a SQL file executed against the remote DB after migrations. Empty to skip.
+    required: false
+    default: ''
+  dry-run:
+    description: 'true to show what would be applied without changing anything.'
+    required: false
+    default: 'false'
+  working-directory:
+    description: Directory containing the `supabase/` folder.
+    required: false
+    default: '.'
+  supabase-version:
+    description: Supabase CLI version.
+    required: false
+    default: 'latest'
+
+outputs:
+  migrations-applied:
+    description: Newline-separated migration versions applied (empty on a dry run).
+    value: ${{ steps.migrate.outputs.applied }}
+  functions-deployed:
+    description: Comma-separated function names deployed.
+    value: ${{ steps.functions.outputs.deployed }}
+  project-url:
+    description: 'The project API URL (`https://<ref>.supabase.co`).'
+    value: https://${{ inputs.project-ref }}.supabase.co
+
+runs:
+  using: composite
+  steps:
+    - name: Set up the Supabase CLI
+      uses: supabase/setup-cli@v3
+      with:
+        version: ${{ inputs.supabase-version }}
+
+    - name: Link the project
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        SUPABASE_ACCESS_TOKEN: ${{ inputs.access-token }}
+        SUPABASE_DB_PASSWORD: ${{ inputs.db-password }}
+        PROJECT_REF: ${{ inputs.project-ref }}
+      run: |
+        set -euo pipefail
+        if [ ! -d supabase ]; then
+          echo "::error::No supabase/ directory in '$PWD'. Set working-directory."
+          exit 1
+        fi
+        # `link` is idempotent and writes supabase/.temp used by the later commands.
+        supabase link --project-ref "$PROJECT_REF"
+        echo "Linked to $PROJECT_REF"
+
+    - name: Apply migrations
+      id: migrate
+      if: inputs.migrate == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        SUPABASE_ACCESS_TOKEN: ${{ inputs.access-token }}
+        SUPABASE_DB_PASSWORD: ${{ inputs.db-password }}
+        DRY_RUN: ${{ inputs.dry-run }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${SUPABASE_DB_PASSWORD:-}" ]; then
+          echo "::error::db-password is required when migrate is true."
+          exit 1
+        fi
+
+        if [ "$DRY_RUN" = "true" ]; then
+          echo "::notice::Dry run — showing pending migrations without applying them."
+          supabase db push --dry-run
+          echo "applied=" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Capture output so the applied versions can be reported back to the PR.
+        supabase db push --include-all | tee /tmp/atk-db-push.log
+
+        applied="$(grep -oE '[0-9]{14}_[A-Za-z0-9_-]+' /tmp/atk-db-push.log | sort -u || true)"
+        {
+          echo 'applied<<__ATK_EOF__'
+          printf '%s\n' "$applied"
+          echo '__ATK_EOF__'
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Run the seed script
+      if: inputs.seed != '' && inputs.dry-run != 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        SUPABASE_ACCESS_TOKEN: ${{ inputs.access-token }}
+        SUPABASE_DB_PASSWORD: ${{ inputs.db-password }}
+        SEED_FILE: ${{ inputs.seed }}
+      run: |
+        set -euo pipefail
+        if [ ! -f "$SEED_FILE" ]; then
+          echo "::error::seed file '$SEED_FILE' does not exist."
+          exit 1
+        fi
+        # Seeds must be idempotent — this runs on every deploy that enables it.
+        supabase db execute --file "$SEED_FILE"
+        echo "Applied seed $SEED_FILE"
+
+    - name: Set function secrets
+      if: inputs.function-secrets != '' && inputs.dry-run != 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        SUPABASE_ACCESS_TOKEN: ${{ inputs.access-token }}
+        PROJECT_REF: ${{ inputs.project-ref }}
+        FUNCTION_SECRETS: ${{ inputs.function-secrets }}
+      run: |
+        set -euo pipefail
+        secret_args=()
+        while IFS= read -r line; do
+          [ -n "$line" ] || continue
+          case "$line" in \#*) continue ;; esac
+          secret_args+=("$line")
+          echo "Setting function secret: ${line%%=*}"
+        done <<< "$FUNCTION_SECRETS"
+        if [ "${#secret_args[@]}" -gt 0 ]; then
+          supabase secrets set --project-ref "$PROJECT_REF" "${secret_args[@]}"
+        fi
+
+    - name: Deploy Edge Functions
+      id: functions
+      if: inputs.functions != '' && inputs.dry-run != 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        SUPABASE_ACCESS_TOKEN: ${{ inputs.access-token }}
+        PROJECT_REF: ${{ inputs.project-ref }}
+        FUNCTIONS: ${{ inputs.functions }}
+        NO_VERIFY_JWT: ${{ inputs.no-verify-jwt }}
+      run: |
+        set -euo pipefail
+
+        common=(--project-ref "$PROJECT_REF")
+        [ "$NO_VERIFY_JWT" = "true" ] && common+=(--no-verify-jwt)
+
+        if [ "$FUNCTIONS" = "all" ]; then
+          if [ ! -d supabase/functions ]; then
+            echo "::error::functions='all' but supabase/functions does not exist."
+            exit 1
+          fi
+          names=()
+          for dir in supabase/functions/*/; do
+            name="$(basename "$dir")"
+            # _shared and other underscore-prefixed dirs are libraries, not functions.
+            case "$name" in _*) continue ;; esac
+            [ -f "${dir}index.ts" ] || continue
+            names+=("$name")
+          done
+        else
+          IFS=',' read -ra names <<< "$FUNCTIONS"
+        fi
+
+        deployed=()
+        for name in "${names[@]}"; do
+          name="$(printf '%s' "$name" | tr -d '[:space:]')"
+          [ -n "$name" ] || continue
+          echo "::group::deploy function $name"
+          supabase functions deploy "$name" "${common[@]}"
+          echo "::endgroup::"
+          deployed+=("$name")
+        done
+
+        if [ "${#deployed[@]}" -eq 0 ]; then
+          echo "::warning::No Edge Functions matched — nothing deployed."
+          echo "deployed=" >> "$GITHUB_OUTPUT"
+        else
+          printf 'deployed=%s\n' "$(IFS=,; echo "${deployed[*]}")" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Push project config
+      if: inputs.config == 'true' && inputs.dry-run != 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        SUPABASE_ACCESS_TOKEN: ${{ inputs.access-token }}
+        PROJECT_REF: ${{ inputs.project-ref }}
+      run: |
+        set -euo pipefail
+        supabase config push --project-ref "$PROJECT_REF"
+        echo "Pushed supabase/config.toml"

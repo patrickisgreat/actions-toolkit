@@ -1,0 +1,202 @@
+# Deploy a container to Cloud Run, with optional traffic splitting for canaries.
+#
+# Two deploy shapes, chosen by `traffic-percent`:
+#   • Left empty (default) — the new revision takes 100% of traffic immediately.
+#   • Set to a number — the revision deploys with `--no-traffic`, then that percentage is
+#     migrated to it. The remainder stays on whatever was serving before, which is what you
+#     want for a canary you intend to promote (or roll back) in a later step.
+#
+# Authenticate with `gcp-auth` first.
+
+name: Deploy to Cloud Run
+description: Deploy a container image to Cloud Run, optionally as a traffic-split canary
+
+inputs:
+  service:
+    description: Cloud Run service name.
+    required: true
+  image:
+    description: 'Container image to deploy. Prefer an immutable digest ref.'
+    required: true
+  region:
+    description: Cloud Run region.
+    required: false
+    default: 'us-central1'
+  project-id:
+    description: GCP project. Empty uses the one gcp-auth resolved.
+    required: false
+    default: ''
+  env-vars:
+    description: Newline-separated `KEY=value` environment variables.
+    required: false
+    default: ''
+  secrets:
+    description: |
+      Newline-separated `KEY=secret-name:version` mappings from Secret Manager, e.g.
+      `API_KEY=api-key:latest`.
+    required: false
+    default: ''
+  service-account:
+    description: Runtime service account email for the revision.
+    required: false
+    default: ''
+  min-instances:
+    description: Minimum instances. `0` scales to zero.
+    required: false
+    default: ''
+  max-instances:
+    description: Maximum instances.
+    required: false
+    default: ''
+  cpu:
+    description: 'CPU allocation, e.g. `1` or `2`.'
+    required: false
+    default: ''
+  memory:
+    description: 'Memory allocation, e.g. `512Mi`.'
+    required: false
+    default: ''
+  concurrency:
+    description: Max concurrent requests per instance.
+    required: false
+    default: ''
+  timeout:
+    description: 'Request timeout, e.g. `300s`.'
+    required: false
+    default: ''
+  allow-unauthenticated:
+    description: 'true to grant public invoke access. Leave false for internal services.'
+    required: false
+    default: 'false'
+  ingress:
+    description: 'all | internal | internal-and-cloud-load-balancing'
+    required: false
+    default: ''
+  traffic-percent:
+    description: |
+      Percentage of traffic to send to the new revision. Empty means 100% immediately;
+      a number deploys with no traffic and then migrates that share (canary).
+    required: false
+    default: ''
+  revision-suffix:
+    description: 'Suffix for the revision name. Empty lets Cloud Run generate one.'
+    required: false
+    default: ''
+  flags:
+    description: Extra raw `gcloud run deploy` flags.
+    required: false
+    default: ''
+
+outputs:
+  url:
+    description: The service URL.
+    value: ${{ steps.deploy.outputs.url }}
+  revision:
+    description: Name of the revision that was created.
+    value: ${{ steps.deploy.outputs.revision }}
+
+runs:
+  using: composite
+  steps:
+    - name: Deploy
+      id: deploy
+      shell: bash
+      env:
+        SERVICE: ${{ inputs.service }}
+        IMAGE: ${{ inputs.image }}
+        REGION: ${{ inputs.region }}
+        PROJECT_ID: ${{ inputs.project-id }}
+        ENV_VARS: ${{ inputs.env-vars }}
+        RUN_SECRETS: ${{ inputs.secrets }}
+        SERVICE_ACCOUNT: ${{ inputs.service-account }}
+        MIN_INSTANCES: ${{ inputs.min-instances }}
+        MAX_INSTANCES: ${{ inputs.max-instances }}
+        CPU: ${{ inputs.cpu }}
+        MEMORY: ${{ inputs.memory }}
+        CONCURRENCY: ${{ inputs.concurrency }}
+        TIMEOUT: ${{ inputs.timeout }}
+        ALLOW_UNAUTH: ${{ inputs.allow-unauthenticated }}
+        INGRESS: ${{ inputs.ingress }}
+        TRAFFIC_PERCENT: ${{ inputs.traffic-percent }}
+        REVISION_SUFFIX: ${{ inputs.revision-suffix }}
+        EXTRA_FLAGS: ${{ inputs.flags }}
+      run: |
+        set -euo pipefail
+
+        args=(run deploy "$SERVICE" --image "$IMAGE" --region "$REGION" --platform managed --quiet)
+        [ -n "$PROJECT_ID" ]       && args+=(--project "$PROJECT_ID")
+        [ -n "$SERVICE_ACCOUNT" ]  && args+=(--service-account "$SERVICE_ACCOUNT")
+        [ -n "$MIN_INSTANCES" ]    && args+=(--min-instances "$MIN_INSTANCES")
+        [ -n "$MAX_INSTANCES" ]    && args+=(--max-instances "$MAX_INSTANCES")
+        [ -n "$CPU" ]              && args+=(--cpu "$CPU")
+        [ -n "$MEMORY" ]           && args+=(--memory "$MEMORY")
+        [ -n "$CONCURRENCY" ]      && args+=(--concurrency "$CONCURRENCY")
+        [ -n "$TIMEOUT" ]          && args+=(--timeout "$TIMEOUT")
+        [ -n "$INGRESS" ]          && args+=(--ingress "$INGRESS")
+        [ -n "$REVISION_SUFFIX" ]  && args+=(--revision-suffix "$REVISION_SUFFIX")
+
+        if [ "$ALLOW_UNAUTH" = "true" ]; then
+          args+=(--allow-unauthenticated)
+        else
+          args+=(--no-allow-unauthenticated)
+        fi
+
+        # gcloud takes these as one comma-joined value, so collapse the newline blocks.
+        # Values containing commas need `^:^`-style delimiters; keep values comma-free.
+        join_kv() {
+          local out=''
+          while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            case "$line" in \#*) continue ;; esac
+            out="${out:+$out,}$line"
+          done
+          printf '%s' "$out"
+        }
+
+        if [ -n "$ENV_VARS" ]; then
+          joined="$(join_kv <<< "$ENV_VARS")"
+          [ -n "$joined" ] && args+=(--set-env-vars "$joined")
+        fi
+        if [ -n "$RUN_SECRETS" ]; then
+          joined="$(join_kv <<< "$RUN_SECRETS")"
+          [ -n "$joined" ] && args+=(--set-secrets "$joined")
+        fi
+
+        # Canary: land the revision without traffic, then migrate a share to it.
+        if [ -n "$TRAFFIC_PERCENT" ]; then
+          args+=(--no-traffic)
+        fi
+
+        # shellcheck disable=SC2086
+        gcloud "${args[@]}" $EXTRA_FLAGS
+
+        describe=(run services describe "$SERVICE" --region "$REGION" --platform managed --format json)
+        [ -n "$PROJECT_ID" ] && describe+=(--project "$PROJECT_ID")
+        svc="$(gcloud "${describe[@]}")"
+
+        revision="$(jq -r '.status.latestCreatedRevisionName' <<< "$svc")"
+        url="$(jq -r '.status.url' <<< "$svc")"
+
+        if [ -n "$TRAFFIC_PERCENT" ]; then
+          traffic=(run services update-traffic "$SERVICE" --region "$REGION" --platform managed --quiet
+                   --to-revisions "${revision}=${TRAFFIC_PERCENT}")
+          [ -n "$PROJECT_ID" ] && traffic+=(--project "$PROJECT_ID")
+          gcloud "${traffic[@]}"
+          echo "Migrated ${TRAFFIC_PERCENT}% of traffic to $revision"
+        fi
+
+        {
+          echo "url=$url"
+          echo "revision=$revision"
+        } >> "$GITHUB_OUTPUT"
+
+        {
+          echo "### ☁️ Cloud Run deploy"
+          echo
+          echo "| | |"
+          echo "|---|---|"
+          echo "| Service | \`${SERVICE}\` |"
+          echo "| Revision | \`${revision}\` |"
+          echo "| Traffic | \`${TRAFFIC_PERCENT:-100}%\` |"
+          echo "| URL | ${url} |"
+        } >> "$GITHUB_STEP_SUMMARY"
