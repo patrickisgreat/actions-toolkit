@@ -1,0 +1,268 @@
+# CI for this repo. Not reusable — the `self-` prefix marks it as ours.
+#
+# A toolkit that ships broken pipelines is worse than no toolkit, because the failure lands
+# in someone else's repo where they can't fix it. So this does more than lint:
+#
+#   lint      — actionlint (with shellcheck on every `run:`), yamllint, commitlint
+#   validate  — the repo's own conventions (scripts/validate-manifests.mjs)
+#   docs      — generated docs must match the manifests
+#   execute   — the actions that can run without cloud credentials are actually RUN and
+#               their outputs asserted. Static analysis cannot tell you that a jq filter
+#               produces the shape the next step reads.
+#   consume   — the reusable workflows are called end-to-end from this repo, exercising the
+#               `.toolkit` checkout mechanism the whole design rests on.
+
+name: Self CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Rapid pushes shouldn't each run a full pipeline. `main` is exempt: every merge there is a
+# release candidate that consumers will pin to.
+concurrency:
+  group: self-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  # See the Makefile: nearly every `run:` here embeds a single-quoted jq program whose
+  # `$name` references are jq variables, so SC2016 is a false positive in essentially
+  # every instance and its noise would bury real findings.
+  SHELLCHECK_OPTS: --exclude=SC2016
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run actionlint
+        uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Run yamllint
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet yamllint
+          yamllint -c .yamllint.yml .github actions
+
+  validate:
+    name: Validate manifests & docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install tooling
+        run: |
+          set -euo pipefail
+          npm ci || npm install
+
+      - name: Validate manifest conventions
+        run: |
+          set -euo pipefail
+          node scripts/validate-manifests.mjs
+
+      - name: Check generated docs
+        run: |
+          set -euo pipefail
+          node scripts/gen-docs.mjs --check
+
+  commitlint:
+    name: Commit messages
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Lint PR commits against Conventional Commits
+        uses: wagoid/commitlint-github-action@v6
+        with:
+          configFile: commitlint.config.mjs
+
+  # ── Execute the credential-free actions and assert their outputs ─────────────────────
+  test-actions:
+    name: Execute actions
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # `./actions/...` works here because this IS the toolkit repo — the `.toolkit`
+      # indirection is only needed inside reusable workflows called from elsewhere.
+      - name: resolve-env — maps, literals, and a missing secret
+        id: resolve
+        uses: ./actions/resolve-env
+        with:
+          mappings: |
+            MAPPED_VALUE=FAKE_SECRET
+            ABSENT_VALUE=DOES_NOT_EXIST
+          literal-vars: |
+            LITERAL_VALUE=hello
+          mask-literals: 'false'
+          secrets-json: '{"FAKE_SECRET":"resolved-ok"}'
+
+      - name: Assert resolve-env
+        env:
+          RESOLVED: ${{ steps.resolve.outputs.resolved }}
+        run: |
+          set -euo pipefail
+          [ "$MAPPED_VALUE" = "resolved-ok" ] || { echo "::error::mapping did not resolve (got '${MAPPED_VALUE:-}')"; exit 1; }
+          [ "$LITERAL_VALUE" = "hello" ] || { echo "::error::literal did not resolve"; exit 1; }
+          # A mapping with no matching secret must warn and be skipped, not fail the step
+          # and not export an empty variable.
+          [ -z "${ABSENT_VALUE:-}" ] || { echo "::error::absent mapping should not have been exported"; exit 1; }
+          [ "$RESOLVED" = "MAPPED_VALUE,LITERAL_VALUE" ] || { echo "::error::unexpected resolved list '$RESOLVED'"; exit 1; }
+          echo "resolve-env OK"
+
+      - name: setup-node — detect pnpm and install
+        id: setup-node
+        uses: ./actions/setup-node
+        with:
+          node-version: '22'
+          working-directory: tests/fixtures/node-pnpm
+          install: 'false'
+
+      - name: Assert setup-node
+        env:
+          MANAGER: ${{ steps.setup-node.outputs.package-manager }}
+        run: |
+          set -euo pipefail
+          [ "$MANAGER" = "pnpm" ] || { echo "::error::expected pnpm, detected '$MANAGER'"; exit 1; }
+          node --version
+          echo "setup-node OK"
+
+      - name: changed-files — directory matrix
+        id: changed
+        uses: ./actions/changed-files
+        with:
+          matrix-glob: 'tests/fixtures/**'
+          matrix-marker: 'marker.txt'
+
+      - name: Assert changed-files
+        env:
+          DIRECTORIES: ${{ steps.changed.outputs.directories }}
+        run: |
+          set -euo pipefail
+          echo "directories=$DIRECTORIES"
+          jq -e 'type == "array"' <<< "$DIRECTORIES" > /dev/null ||
+            { echo "::error::directories is not a JSON array"; exit 1; }
+          echo "changed-files OK"
+
+      - name: notify — job summary only
+        uses: ./actions/notify
+        with:
+          status: success
+          title: Self-CI notification test
+          text: Rendered by the `notify` action with no webhooks configured.
+          fields: '{"Suite":"self-ci","Runner":"ubuntu-latest"}'
+
+      - name: pr-comment — no-op outside a PR
+        id: comment
+        uses: ./actions/pr-comment
+        with:
+          marker: self-ci-smoke
+          body: This should be skipped on a push, and posted on a pull request.
+
+      - name: setup-terraform — resolve the version and run fmt
+        id: setup-tf
+        uses: ./actions/setup-terraform
+        with:
+          version: '1.9.8'
+          tflint: 'true'
+
+      - name: Assert setup-terraform
+        env:
+          TF_VERSION: ${{ steps.setup-tf.outputs.version }}
+        run: |
+          set -euo pipefail
+          [ "$TF_VERSION" = "1.9.8" ] || { echo "::error::expected 1.9.8, got '$TF_VERSION'"; exit 1; }
+          terraform version
+          tflint --version
+          echo "setup-terraform OK"
+
+      - name: setup-python — uv install in a fixture project
+        id: setup-py
+        uses: ./actions/setup-python
+        with:
+          python-version: '3.12'
+          working-directory: tests/fixtures/python-uv
+          groups: ''
+
+      - name: Assert setup-python
+        run: |
+          set -euo pipefail
+          python --version
+          echo "setup-python OK"
+
+  # ── Call the reusable workflows for real ─────────────────────────────────────────────
+  # This is the only way to prove the `.toolkit` checkout mechanism works: the job resolves
+  # `github.job_workflow_sha` and clones this repo at it, exactly as a consumer would.
+  consume-node-ci:
+    name: Consume node-ci
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    uses: ./.github/workflows/node-ci.yml
+    with:
+      working-directory: tests/fixtures/node-pnpm
+      lint-command: ''
+      format-command: ''
+      typecheck-command: ''
+      test-command: 'run test'
+      build-command: 'run build'
+      coverage: false
+      e2e: none
+
+  consume-terraform-ci:
+    name: Consume terraform-ci
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    uses: ./.github/workflows/terraform-ci.yml
+    with:
+      directories: 'tests/fixtures/terraform'
+      version: '1.9.8'
+      tflint: false
+      trivy: false
+      docs-check: false
+
+  all-green:
+    name: All checks
+    # A single required status check for branch protection: as jobs are added above, the
+    # protection rule doesn't have to be edited to match.
+    needs: [lint, validate, test-actions, consume-node-ci, consume-terraform-ci]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify every job succeeded
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          failed="$(jq -r 'to_entries[] | select(.value.result != "success" and .value.result != "skipped") | .key' <<< "$RESULTS")"
+          if [ -n "$failed" ]; then
+            echo "::error::Failed job(s): $(tr '\n' ' ' <<< "$failed")"
+            exit 1
+          fi
+          echo "All checks passed."

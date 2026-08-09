@@ -1,0 +1,114 @@
+# Authenticate to Google Cloud, Workload Identity Federation first.
+#
+# WIF is the GCP equivalent of AWS OIDC: the job's GitHub identity token is exchanged for a
+# short-lived GCP access token, so no service-account JSON key ever lives in the repo.
+# Needs `permissions: id-token: write` and a workload identity provider whose attribute
+# condition pins `assertion.repository` to this repo — see docs/SECURITY.md.
+#
+# Service-account JSON keys remain supported (some GCP APIs and older tooling still need
+# one), but the action warns, because an exported SA key is a permanent credential in a
+# secret store.
+
+name: GCP auth
+description: Authenticate to Google Cloud via Workload Identity Federation or an SA key
+
+inputs:
+  workload-identity-provider:
+    description: 'Full WIF provider resource name (`projects/N/locations/global/workloadIdentityPools/P/providers/R`).'
+    required: false
+    default: ''
+  service-account:
+    description: Service account email to impersonate via WIF.
+    required: false
+    default: ''
+  credentials-json:
+    description: Service-account JSON key. Only used when no WIF provider is set.
+    required: false
+    default: ''
+  project-id:
+    description: Project to set as the active gcloud project.
+    required: false
+    default: ''
+  setup-gcloud:
+    description: 'true to install the gcloud CLI as well as authenticating.'
+    required: false
+    default: 'true'
+  gcloud-components:
+    description: 'Comma-separated extra gcloud components, e.g. `beta,gke-gcloud-auth-plugin`.'
+    required: false
+    default: ''
+  docker-registries:
+    description: |
+      Comma-separated Artifact Registry / GCR hosts to configure Docker for, e.g.
+      `us-central1-docker.pkg.dev,gcr.io`. Empty skips Docker configuration.
+    required: false
+    default: ''
+  token-format:
+    description: '`access_token` (default) or `id_token`. `id_token` is for calling Cloud Run/IAP.'
+    required: false
+    default: 'access_token'
+  id-token-audience:
+    description: Audience for `id_token` format.
+    required: false
+    default: ''
+
+outputs:
+  project-id:
+    description: The resolved project ID.
+    value: ${{ steps.auth.outputs.project_id }}
+  access-token:
+    description: Short-lived OAuth access token. Treat as a secret.
+    value: ${{ steps.auth.outputs.access_token }}
+  id-token:
+    description: OIDC ID token, when `token-format` is `id_token`.
+    value: ${{ steps.auth.outputs.id_token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate credentials
+      shell: bash
+      env:
+        WIF: ${{ inputs.workload-identity-provider }}
+        SA_JSON: ${{ inputs.credentials-json }}
+      run: |
+        set -euo pipefail
+        if [ -z "$WIF" ] && [ -z "$SA_JSON" ]; then
+          echo "::error::No GCP credentials provided. Set workload-identity-provider (preferred) or credentials-json."
+          exit 1
+        fi
+        if [ -z "$WIF" ]; then
+          echo "::warning::Authenticating with a service-account JSON key. Prefer Workload Identity Federation — see docs/SECURITY.md."
+        fi
+
+    - name: Authenticate to Google Cloud
+      id: auth
+      uses: google-github-actions/auth@v3
+      with:
+        workload_identity_provider: ${{ inputs.workload-identity-provider }}
+        service_account: ${{ inputs.service-account }}
+        credentials_json: ${{ inputs.credentials-json }}
+        project_id: ${{ inputs.project-id }}
+        token_format: ${{ inputs.token-format }}
+        audience: ${{ inputs.id-token-audience }}
+        # Needed by gcloud, terraform's google provider, and the client libraries alike.
+        export_environment_variables: true
+        create_credentials_file: true
+
+    - name: Set up gcloud
+      if: inputs.setup-gcloud == 'true'
+      uses: google-github-actions/setup-gcloud@v3
+      with:
+        project_id: ${{ inputs.project-id }}
+        install_components: ${{ inputs.gcloud-components }}
+
+    - name: Configure Docker for Artifact Registry
+      if: inputs.docker-registries != ''
+      shell: bash
+      env:
+        REGISTRIES: ${{ inputs.docker-registries }}
+      run: |
+        set -euo pipefail
+        # gcloud writes a credential helper entry per host into ~/.docker/config.json.
+        gcloud auth configure-docker "$REGISTRIES" --quiet
+        echo "Configured Docker for: $REGISTRIES"

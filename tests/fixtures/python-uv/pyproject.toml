@@ -1,0 +1,14 @@
+# Fixture for self-CI: exercises uv interpreter pinning and `uv sync` with no dependencies.
+[project]
+name = "atk-fixture-python-uv"
+version = "0.0.0"
+description = "Fixture project for actions-toolkit self-CI."
+requires-python = ">=3.11"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/atk_fixture"]

@@ -1,0 +1,258 @@
+# Deploy to Google Cloud — Cloud Run today, with the same auth/gating/notify shell as the
+# AWS workflow so switching clouds doesn't mean relearning the pipeline.
+#
+# Canary support is built in rather than bolted on: set `traffic-percent` and the revision
+# lands with no traffic, then takes that share. A follow-up `promote` run (traffic-percent
+# empty) moves the rest over once you're satisfied, and doing nothing rolls back by simply
+# leaving the old revision serving.
+#
+# Authentication is Workload Identity Federation by default — no service-account JSON key.
+
+name: Deploy GCP
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: 'cloud-run | static'
+        type: string
+        required: false
+        default: 'cloud-run'
+      project-id:
+        description: GCP project.
+        type: string
+        required: false
+        default: ''
+      region:
+        description: Region for the service.
+        type: string
+        required: false
+        default: 'us-central1'
+      workload-identity-provider:
+        description: WIF provider resource name. Preferred over a service-account key.
+        type: string
+        required: false
+        default: ''
+      service-account:
+        description: Service account to impersonate via WIF.
+        type: string
+        required: false
+        default: ''
+      environment-name:
+        description: GitHub Environment to deploy through.
+        type: string
+        required: false
+        default: ''
+
+      # ── cloud-run ────────────────────────────────────────────────────────────
+      service:
+        description: Cloud Run service name.
+        type: string
+        required: false
+        default: ''
+      image:
+        description: 'Container image. Prefer an immutable digest ref.'
+        type: string
+        required: false
+        default: ''
+      env-vars:
+        description: Newline-separated `KEY=value` environment variables.
+        type: string
+        required: false
+        default: ''
+      secret-refs:
+        description: 'Newline-separated `KEY=secret-name:version` Secret Manager mappings.'
+        type: string
+        required: false
+        default: ''
+      runtime-service-account:
+        description: Runtime service account for the revision.
+        type: string
+        required: false
+        default: ''
+      min-instances:
+        description: Minimum instances.
+        type: string
+        required: false
+        default: ''
+      max-instances:
+        description: Maximum instances.
+        type: string
+        required: false
+        default: ''
+      cpu:
+        description: CPU allocation.
+        type: string
+        required: false
+        default: ''
+      memory:
+        description: Memory allocation.
+        type: string
+        required: false
+        default: ''
+      allow-unauthenticated:
+        description: 'true to make the service public.'
+        type: boolean
+        required: false
+        default: false
+      traffic-percent:
+        description: |
+          Share of traffic for the new revision. Empty means 100% immediately; a number
+          deploys with no traffic and then migrates that percentage (canary).
+        type: string
+        required: false
+        default: ''
+
+      # ── static (GCS) ─────────────────────────────────────────────────────────
+      source:
+        description: 'Local directory to publish for `target: static`.'
+        type: string
+        required: false
+        default: ''
+      bucket:
+        description: 'Target GCS bucket URI, e.g. `gs://my-site`.'
+        type: string
+        required: false
+        default: ''
+
+      notify:
+        description: 'true to send a Slack/Discord notification.'
+        type: boolean
+        required: false
+        default: true
+      runs-on:
+        description: Runner label.
+        type: string
+        required: false
+        default: 'ubuntu-latest'
+      timeout-minutes:
+        description: Job timeout.
+        type: number
+        required: false
+        default: 30
+
+    secrets:
+      GCP_CREDENTIALS_JSON:
+        description: Service-account key, used only when no WIF provider is given.
+        required: false
+      SLACK_WEBHOOK:
+        required: false
+      DISCORD_WEBHOOK:
+        required: false
+
+    outputs:
+      url:
+        description: The deployed service URL.
+        value: ${{ jobs.deploy.outputs.url }}
+      revision:
+        description: The Cloud Run revision that was created.
+        value: ${{ jobs.deploy.outputs.revision }}
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.target }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    environment:
+      name: ${{ inputs.environment-name }}
+      url: ${{ steps.cloud-run.outputs.url }}
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      url: ${{ steps.cloud-run.outputs.url }}
+      revision: ${{ steps.cloud-run.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Validate the target
+        env:
+          TARGET: ${{ inputs.target }}
+          SERVICE: ${{ inputs.service }}
+          IMAGE: ${{ inputs.image }}
+          SOURCE: ${{ inputs.source }}
+          BUCKET: ${{ inputs.bucket }}
+        run: |
+          set -euo pipefail
+          case "$TARGET" in
+            cloud-run)
+              [ -n "$SERVICE" ] && [ -n "$IMAGE" ] ||
+                { echo "::error::target=cloud-run requires service and image."; exit 1; } ;;
+            static)
+              [ -n "$SOURCE" ] && [ -n "$BUCKET" ] ||
+                { echo "::error::target=static requires source and bucket."; exit 1; } ;;
+            *) echo "::error::target='$TARGET' is not supported (cloud-run|static)."; exit 1 ;;
+          esac
+
+      - name: Authenticate to Google Cloud
+        uses: ./.toolkit/actions/gcp-auth
+        with:
+          workload-identity-provider: ${{ inputs.workload-identity-provider }}
+          service-account: ${{ inputs.service-account }}
+          credentials-json: ${{ secrets.GCP_CREDENTIALS_JSON }}
+          project-id: ${{ inputs.project-id }}
+
+      - name: Deploy to Cloud Run
+        id: cloud-run
+        if: ${{ inputs.target == 'cloud-run' }}
+        uses: ./.toolkit/actions/deploy-cloud-run
+        with:
+          service: ${{ inputs.service }}
+          image: ${{ inputs.image }}
+          region: ${{ inputs.region }}
+          project-id: ${{ inputs.project-id }}
+          env-vars: ${{ inputs.env-vars }}
+          secrets: ${{ inputs.secret-refs }}
+          service-account: ${{ inputs.runtime-service-account }}
+          min-instances: ${{ inputs.min-instances }}
+          max-instances: ${{ inputs.max-instances }}
+          cpu: ${{ inputs.cpu }}
+          memory: ${{ inputs.memory }}
+          allow-unauthenticated: ${{ inputs.allow-unauthenticated }}
+          traffic-percent: ${{ inputs.traffic-percent }}
+
+      - name: Publish to GCS
+        if: ${{ inputs.target == 'static' }}
+        env:
+          SOURCE: ${{ inputs.source }}
+          BUCKET: ${{ inputs.bucket }}
+        run: |
+          set -euo pipefail
+          [ -d "$SOURCE" ] || { echo "::error::source directory '$SOURCE' does not exist."; exit 1; }
+
+          # Same two-pass cache strategy as the S3 deploy: fingerprinted assets get a
+          # one-year immutable header, entry points must always revalidate or visitors
+          # keep loading an app shell that references deleted asset filenames.
+          gcloud storage rsync --recursive --delete-unmatched-destination-objects \
+            --exclude='.*\.html$' \
+            --cache-control='public, max-age=31536000, immutable' \
+            "$SOURCE" "$BUCKET"
+
+          gcloud storage rsync --recursive \
+            --exclude='.*(?<!\.html)$' \
+            --cache-control='public, max-age=0, must-revalidate' \
+            "$SOURCE" "$BUCKET"
+
+          echo "Published $SOURCE to $BUCKET"
+
+      - name: Notify
+        if: ${{ always() && inputs.notify }}
+        uses: ./.toolkit/actions/notify
+        with:
+          status: ${{ job.status }}
+          title: GCP ${{ inputs.target }} deploy — ${{ job.status }}
+          url: ${{ steps.cloud-run.outputs.url }}
+          slack-webhook: ${{ secrets.SLACK_WEBHOOK }}
+          discord-webhook: ${{ secrets.DISCORD_WEBHOOK }}
+          fields: |
+            {"Target":"${{ inputs.target }}","Region":"${{ inputs.region }}","Revision":"${{ steps.cloud-run.outputs.revision || 'n/a' }}"}

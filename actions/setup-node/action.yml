@@ -1,0 +1,186 @@
+# Node toolchain setup with package-manager auto-detection and a dependency install.
+#
+# One action instead of the four-step setup-pnpm / setup-node / install dance that gets
+# copy-pasted into every job. It detects pnpm / yarn / npm / bun from the lockfile, wires
+# up the right dependency cache, and installs with the correct frozen-lockfile flag.
+#
+# The dependabot nuance is built in: Dependabot regenerates lockfiles, so a frozen install
+# fails on its PRs. `frozen-lockfile: auto` (the default) relaxes the flag for
+# `dependabot[bot]` and keeps it strict for everyone else.
+
+name: Setup Node
+description: Set up Node with pnpm/npm/yarn/bun auto-detection, caching, and dependency install
+
+inputs:
+  node-version:
+    description: Node version, or a path-independent spec like `lts/*`. Ignored if `node-version-file` resolves.
+    required: false
+    default: '22'
+  node-version-file:
+    description: Read the version from this file instead (`.nvmrc`, `.node-version`, `package.json`). Empty to ignore.
+    required: false
+    default: ''
+  package-manager:
+    description: 'auto | pnpm | npm | yarn | bun. `auto` detects from the lockfile.'
+    required: false
+    default: 'auto'
+  pnpm-version:
+    description: pnpm version to install. Empty reads `packageManager` from package.json.
+    required: false
+    default: ''
+  install:
+    description: 'true to install dependencies after setup.'
+    required: false
+    default: 'true'
+  frozen-lockfile:
+    description: 'auto | true | false. `auto` means strict, except on Dependabot PRs.'
+    required: false
+    default: 'auto'
+  install-args:
+    description: Extra args appended to the install command.
+    required: false
+    default: ''
+  working-directory:
+    description: Directory to run in.
+    required: false
+    default: '.'
+  cache:
+    description: 'true to enable the built-in dependency cache.'
+    required: false
+    default: 'true'
+
+outputs:
+  package-manager:
+    description: The resolved package manager (`pnpm`, `npm`, `yarn`, or `bun`).
+    value: ${{ steps.detect.outputs.manager }}
+  node-version:
+    description: The Node version actually installed.
+    value: ${{ steps.node.outputs.node-version }}
+  cache-hit:
+    description: 'Whether the dependency cache was restored (`true`/`false`).'
+    value: ${{ steps.node.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Detect package manager
+      id: detect
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        REQUESTED: ${{ inputs.package-manager }}
+        FROZEN: ${{ inputs.frozen-lockfile }}
+        ACTOR: ${{ github.actor }}
+      run: |
+        set -euo pipefail
+
+        manager="$REQUESTED"
+        if [ "$manager" = "auto" ]; then
+          if   [ -f pnpm-lock.yaml ];                        then manager=pnpm
+          elif [ -f yarn.lock ];                             then manager=yarn
+          elif [ -f bun.lockb ] || [ -f bun.lock ];          then manager=bun
+          elif [ -f package-lock.json ];                     then manager=npm
+          elif [ -f package.json ];                          then manager=npm
+          else
+            echo "::error::No package.json found in '$PWD'. Set working-directory or package-manager."
+            exit 1
+          fi
+          echo "Detected package manager: $manager"
+        fi
+
+        case "$manager" in
+          pnpm|npm|yarn|bun) ;;
+          *) echo "::error::package-manager='$manager' is not supported (pnpm|npm|yarn|bun)."; exit 1 ;;
+        esac
+
+        # Dependabot installs regenerate the lockfile, so a frozen install always fails on
+        # its PRs. Relax there and stay strict everywhere else.
+        frozen="$FROZEN"
+        if [ "$frozen" = "auto" ]; then
+          if [ "$ACTOR" = "dependabot[bot]" ]; then
+            frozen=false
+            echo "::notice::Dependabot run — installing with a non-frozen lockfile."
+          else
+            frozen=true
+          fi
+        fi
+
+        # setup-node's `cache:` input doesn't know about bun.
+        case "$manager" in
+          bun) cache_key='' ;;
+          *)   cache_key="$manager" ;;
+        esac
+
+        {
+          echo "manager=$manager"
+          echo "frozen=$frozen"
+          echo "cache_key=$cache_key"
+        } >> "$GITHUB_OUTPUT"
+
+    # pnpm must be on PATH before setup-node runs, or setup-node's pnpm cache lookup fails.
+    - name: Set up pnpm
+      if: steps.detect.outputs.manager == 'pnpm'
+      uses: pnpm/action-setup@v6.0.10
+      with:
+        version: ${{ inputs.pnpm-version }}
+
+    - name: Set up Bun
+      if: steps.detect.outputs.manager == 'bun'
+      uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: latest
+
+    - name: Set up Node
+      id: node
+      uses: actions/setup-node@v7
+      with:
+        node-version: ${{ inputs.node-version }}
+        node-version-file: ${{ inputs.node-version-file }}
+        cache: ${{ inputs.cache == 'true' && steps.detect.outputs.cache_key || '' }}
+        cache-dependency-path: ${{ inputs.working-directory }}
+
+    - name: Install dependencies
+      if: inputs.install == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        MANAGER: ${{ steps.detect.outputs.manager }}
+        FROZEN: ${{ steps.detect.outputs.frozen }}
+        EXTRA_ARGS: ${{ inputs.install-args }}
+      run: |
+        set -euo pipefail
+
+        # Word-splitting EXTRA_ARGS is intentional — it is a caller-supplied arg string.
+        # shellcheck disable=SC2086
+        case "$MANAGER" in
+          pnpm)
+            if [ "$FROZEN" = "true" ]; then
+              pnpm install --frozen-lockfile $EXTRA_ARGS
+            else
+              pnpm install --no-frozen-lockfile $EXTRA_ARGS
+            fi
+            ;;
+          npm)
+            # `npm ci` requires a lockfile in sync with package.json — the npm equivalent
+            # of frozen. Fall back to `npm install` when it isn't (or there's no lockfile).
+            if [ "$FROZEN" = "true" ] && [ -f package-lock.json ]; then
+              npm ci $EXTRA_ARGS
+            else
+              npm install $EXTRA_ARGS
+            fi
+            ;;
+          yarn)
+            if [ "$FROZEN" = "true" ]; then
+              yarn install --immutable $EXTRA_ARGS 2>/dev/null || yarn install --frozen-lockfile $EXTRA_ARGS
+            else
+              yarn install $EXTRA_ARGS
+            fi
+            ;;
+          bun)
+            if [ "$FROZEN" = "true" ]; then
+              bun install --frozen-lockfile $EXTRA_ARGS
+            else
+              bun install $EXTRA_ARGS
+            fi
+            ;;
+        esac

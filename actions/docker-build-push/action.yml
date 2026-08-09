@@ -1,0 +1,280 @@
+# Build a container image and push it to GHCR, ECR, Artifact Registry, Docker Hub, or any
+# other registry — with sensible tags, layer caching, multi-arch, and optional provenance
+# attestation.
+#
+# The registry is a parameter rather than five near-identical actions. Login is handled
+# here for GHCR and Docker Hub; for ECR and Artifact Registry you authenticate first with
+# `aws-auth` (ecr-login: true) or `gcp-auth` (docker-registries: ...) and this action
+# reuses that Docker credential.
+#
+# Tagging is delegated to docker/metadata-action, so the defaults are the conventional
+# ones: `latest` on the default branch, `pr-N` on pull requests, the branch name on
+# branches, semver tags (`1.4.0`, `1.4`, `1`) on `v*` tags, and always an immutable
+# `sha-<short>`. Deploy actions should reference the digest output, not a mutable tag.
+#
+# Caching uses GitHub Actions cache by default, which needs no extra infrastructure.
+# `cache: registry` is better for large images and cross-repo reuse.
+
+name: Docker build & push
+description: Build, tag, cache, and push a container image to any registry
+
+inputs:
+  registry:
+    description: 'ghcr | dockerhub | ecr | gar | custom. Selects the login path and default host.'
+    required: false
+    default: 'ghcr'
+  registry-host:
+    description: |
+      Explicit registry host. Required for `ecr`/`gar`/`custom`, e.g.
+      `123456789012.dkr.ecr.us-east-1.amazonaws.com` or `us-central1-docker.pkg.dev`.
+    required: false
+    default: ''
+  image:
+    description: 'Image repository path without the host, e.g. `myorg/api`. Defaults to this repo''s name.'
+    required: false
+    default: ''
+  context:
+    description: Build context path.
+    required: false
+    default: '.'
+  file:
+    description: Path to the Dockerfile.
+    required: false
+    default: ''
+  target:
+    description: Dockerfile stage to build.
+    required: false
+    default: ''
+  platforms:
+    description: 'Comma-separated build platforms, e.g. `linux/amd64,linux/arm64`.'
+    required: false
+    default: 'linux/amd64'
+  build-args:
+    description: Newline-separated `KEY=value` build arguments. Never put secrets here.
+    required: false
+    default: ''
+  secrets:
+    description: 'Newline-separated BuildKit secrets (`id=NAME,env=ENV_VAR`). Use this, not build-args.'
+    required: false
+    default: ''
+  push:
+    description: 'true to push, false to build only (the right default for PR validation).'
+    required: false
+    default: 'true'
+  tags:
+    description: Explicit newline-separated full tags. Overrides the generated tag set.
+    required: false
+    default: ''
+  extra-tags:
+    description: Additional docker/metadata-action `tags:` rules appended to the defaults.
+    required: false
+    default: ''
+  labels:
+    description: Additional newline-separated OCI labels.
+    required: false
+    default: ''
+  cache:
+    description: 'gha | registry | none'
+    required: false
+    default: 'gha'
+  provenance:
+    description: 'true to attach SLSA build provenance to the pushed image.'
+    required: false
+    default: 'false'
+  sbom:
+    description: 'true to generate and attach an SBOM.'
+    required: false
+    default: 'false'
+  username:
+    description: Registry username. Defaults to `github.actor` for GHCR.
+    required: false
+    default: ''
+  password:
+    description: Registry password/token. `GITHUB_TOKEN` works for GHCR.
+    required: false
+    default: ''
+
+outputs:
+  image:
+    description: 'Fully qualified image reference without a tag (`host/repo`).'
+    value: ${{ steps.resolve.outputs.image_ref }}
+  tags:
+    description: Newline-separated list of tags that were built.
+    value: ${{ steps.meta.outputs.tags }}
+  version:
+    description: The primary version tag docker/metadata-action chose.
+    value: ${{ steps.meta.outputs.version }}
+  digest:
+    description: 'Image digest (`sha256:…`). Deploy this, not a tag.'
+    value: ${{ steps.build.outputs.digest }}
+  image-digest-ref:
+    description: 'Immutable `host/repo@sha256:…` reference. The right thing to hand a deploy step.'
+    value: ${{ steps.resolve.outputs.image_ref }}@${{ steps.build.outputs.digest }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve registry and image
+      id: resolve
+      shell: bash
+      env:
+        REGISTRY: ${{ inputs.registry }}
+        REGISTRY_HOST: ${{ inputs.registry-host }}
+        IMAGE: ${{ inputs.image }}
+        REPO_NAME: ${{ github.event.repository.name }}
+        REPO_OWNER: ${{ github.repository_owner }}
+        EXPLICIT_TAGS: ${{ inputs.tags }}
+        EXTRA_TAGS: ${{ inputs.extra-tags }}
+      run: |
+        set -euo pipefail
+
+        host="$REGISTRY_HOST"
+        case "$REGISTRY" in
+          ghcr)      host="${host:-ghcr.io}" ;;
+          dockerhub) host="${host:-docker.io}" ;;
+          ecr|gar|custom)
+            if [ -z "$host" ]; then
+              echo "::error::registry='$REGISTRY' requires registry-host."
+              exit 1
+            fi ;;
+          *) echo "::error::registry='$REGISTRY' is not supported (ghcr|dockerhub|ecr|gar|custom)."; exit 1 ;;
+        esac
+
+        image="$IMAGE"
+        if [ -z "$image" ]; then
+          # GHCR images are namespaced under the owner; elsewhere the bare repo name is
+          # the least surprising default.
+          if [ "$REGISTRY" = "ghcr" ]; then
+            image="$(printf '%s/%s' "$REPO_OWNER" "$REPO_NAME" | tr '[:upper:]' '[:lower:]')"
+          else
+            image="$REPO_NAME"
+          fi
+        fi
+
+        # Docker Hub official-style refs omit the docker.io host.
+        if [ "$host" = "docker.io" ]; then
+          image_ref="$image"
+        else
+          image_ref="$host/$image"
+        fi
+
+        # Tag rules for docker/metadata-action. Built here rather than in a workflow
+        # expression because GitHub expressions have no multi-line string literal.
+        #
+        # The default set: branch name on branches, pr-N on PRs, full semver ladder on
+        # v* tags, an immutable sha-<short> always, and `latest` only on the default
+        # branch. Explicit `tags:` replaces the whole set; `extra-tags` appends to it.
+        if [ -n "$EXPLICIT_TAGS" ]; then
+          tag_rules="$EXPLICIT_TAGS"
+        else
+          tag_rules="$(cat <<'RULES'
+        type=ref,event=branch
+        type=ref,event=pr
+        type=semver,pattern={{version}}
+        type=semver,pattern={{major}}.{{minor}}
+        type=semver,pattern={{major}}
+        type=sha,format=short,prefix=sha-
+        type=raw,value=latest,enable={{is_default_branch}}
+        RULES
+          )"
+          # Strip the heredoc's leading indentation.
+          tag_rules="$(printf '%s\n' "$tag_rules" | sed 's/^[[:space:]]*//')"
+          if [ -n "$EXTRA_TAGS" ]; then
+            tag_rules="$tag_rules"$'\n'"$EXTRA_TAGS"
+          fi
+        fi
+
+        {
+          echo "host=$host"
+          echo "image_ref=$image_ref"
+          echo 'tag_rules<<__ATK_EOF__'
+          printf '%s\n' "$tag_rules"
+          echo '__ATK_EOF__'
+        } >> "$GITHUB_OUTPUT"
+        echo "Image: $image_ref"
+
+    - name: Set up QEMU
+      if: contains(inputs.platforms, ',') || contains(inputs.platforms, 'arm')
+      uses: docker/setup-qemu-action@v4
+
+    - name: Set up Buildx
+      uses: docker/setup-buildx-action@v4
+
+    # ECR and Artifact Registry are already authenticated by aws-auth / gcp-auth, so only
+    # the token-based registries need a login step here.
+    - name: Log in to GHCR
+      if: inputs.registry == 'ghcr' && inputs.push == 'true'
+      uses: docker/login-action@v4
+      with:
+        registry: ghcr.io
+        username: ${{ inputs.username || github.actor }}
+        password: ${{ inputs.password || github.token }}
+
+    - name: Log in to Docker Hub
+      if: inputs.registry == 'dockerhub' && inputs.push == 'true'
+      uses: docker/login-action@v4
+      with:
+        username: ${{ inputs.username }}
+        password: ${{ inputs.password }}
+
+    - name: Log in to a custom registry
+      if: inputs.registry == 'custom' && inputs.push == 'true' && inputs.password != ''
+      uses: docker/login-action@v4
+      with:
+        registry: ${{ steps.resolve.outputs.host }}
+        username: ${{ inputs.username }}
+        password: ${{ inputs.password }}
+
+    - name: Compute tags and labels
+      id: meta
+      uses: docker/metadata-action@v6
+      with:
+        images: ${{ steps.resolve.outputs.image_ref }}
+        tags: ${{ steps.resolve.outputs.tag_rules }}
+        labels: ${{ inputs.labels }}
+
+    - name: Build and push
+      id: build
+      uses: docker/build-push-action@v7
+      with:
+        context: ${{ inputs.context }}
+        file: ${{ inputs.file }}
+        target: ${{ inputs.target }}
+        platforms: ${{ inputs.platforms }}
+        push: ${{ inputs.push }}
+        # Load single-platform builds into the local daemon when not pushing, so a later
+        # step can scan or smoke-test the image.
+        load: ${{ inputs.push != 'true' && !contains(inputs.platforms, ',') }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        build-args: ${{ inputs.build-args }}
+        secrets: ${{ inputs.secrets }}
+        provenance: ${{ inputs.provenance == 'true' && 'mode=max' || 'false' }}
+        sbom: ${{ inputs.sbom }}
+        cache-from: ${{ inputs.cache == 'gha' && 'type=gha' || inputs.cache == 'registry' && format('type=registry,ref={0}:buildcache', steps.resolve.outputs.image_ref) || '' }}
+        cache-to: ${{ inputs.cache == 'gha' && 'type=gha,mode=max' || inputs.cache == 'registry' && format('type=registry,ref={0}:buildcache,mode=max', steps.resolve.outputs.image_ref) || '' }}
+
+    - name: Summarize
+      shell: bash
+      env:
+        IMAGE_REF: ${{ steps.resolve.outputs.image_ref }}
+        DIGEST: ${{ steps.build.outputs.digest }}
+        TAGS: ${{ steps.meta.outputs.tags }}
+        PUSHED: ${{ inputs.push }}
+        PLATFORMS: ${{ inputs.platforms }}
+      run: |
+        set -euo pipefail
+        {
+          echo "### 🐳 ${IMAGE_REF}"
+          echo
+          echo "| | |"
+          echo "|---|---|"
+          echo "| Pushed | \`${PUSHED}\` |"
+          echo "| Platforms | \`${PLATFORMS}\` |"
+          echo "| Digest | \`${DIGEST:-n/a}\` |"
+          echo
+          echo "Tags:"
+          echo '```'
+          echo "$TAGS"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"

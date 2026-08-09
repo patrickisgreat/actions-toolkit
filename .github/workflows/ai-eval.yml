@@ -1,0 +1,307 @@
+# Run an LLM eval suite on every PR and gate the merge on it.
+#
+# This is the missing CI stage for anything that ships a prompt. Unit tests tell you the
+# code around the model works; only an eval tells you the model still does the job after
+# you reworded the system prompt or bumped the model version.
+#
+# The baseline flow is what makes it useful over time: the score from the default branch is
+# fetched (from a committed baseline file or the previous run's artifact) and the PR is
+# failed on a *regression*, not just on an absolute threshold. That catches the slow
+# erosion that a fixed threshold set generously at the start will never notice.
+#
+# Provider keys reach the suite through `provider-keys`, a `ENV_NAME=SECRET_NAME` mapping,
+# so this workflow never has to know whether you use OpenRouter, Anthropic, or a local
+# vLLM endpoint.
+#
+# Usage:
+#   jobs:
+#     eval:
+#       uses: patrickisgreat/actions-toolkit/.github/workflows/ai-eval.yml@v1
+#       with:
+#         threshold: '90'
+#         max-regression: '2'
+#         provider-keys: |
+#           OPENROUTER_API_KEY=OPENROUTER_API_KEY
+#       secrets: inherit
+
+name: AI eval
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: 'promptfoo | custom'
+        type: string
+        required: false
+        default: 'promptfoo'
+      config:
+        description: promptfoo config file.
+        type: string
+        required: false
+        default: 'promptfooconfig.yaml'
+      command:
+        description: 'Command for `runner: custom`. Must write the results file.'
+        type: string
+        required: false
+        default: ''
+      results-file:
+        description: Results JSON path.
+        type: string
+        required: false
+        default: 'eval-results.json'
+      pass-rate-jq:
+        description: jq expression returning `[passes, failures]` from the results file.
+        type: string
+        required: false
+        default: '[(.results.stats.successes // 0), (.results.stats.failures // 0)]'
+      threshold:
+        description: Minimum pass rate percentage.
+        type: string
+        required: false
+        default: '100'
+      max-regression:
+        description: Allowed drop in percentage points versus the baseline.
+        type: string
+        required: false
+        default: '0'
+      baseline-file:
+        description: |
+          Committed baseline score (`{"pass_rate": 92.5}`). Empty falls back to the
+          baseline artifact published by the last run on the default branch.
+        type: string
+        required: false
+        default: ''
+      publish-baseline:
+        description: |
+          'true to publish this run''s score as the new baseline artifact. Callers should
+          set this only on the default branch — publishing from a PR would let a
+          regression rewrite the baseline it was supposed to be measured against.'
+        type: boolean
+        required: false
+        default: false
+      max-cost-usd:
+        description: Abort if the suite costs more than this.
+        type: string
+        required: false
+        default: ''
+      concurrency-limit:
+        description: Parallel eval requests.
+        type: string
+        required: false
+        default: '4'
+      cache:
+        description: 'true to let promptfoo reuse cached responses for unchanged cases.'
+        type: boolean
+        required: false
+        default: true
+      python:
+        description: 'true to set up Python (for a pytest/DeepEval-style custom runner).'
+        type: boolean
+        required: false
+        default: false
+      node:
+        description: 'true to set up Node (needed by promptfoo).'
+        type: boolean
+        required: false
+        default: true
+      provider-keys:
+        description: Newline-separated `ENV_NAME=SECRET_NAME` mappings for model API keys.
+        type: string
+        required: false
+        default: ''
+      working-directory:
+        description: Directory to run in.
+        type: string
+        required: false
+        default: '.'
+      comment-on-pr:
+        description: 'true to post the score as a sticky PR comment.'
+        type: boolean
+        required: false
+        default: true
+      fail-on-threshold:
+        description: 'false to report the score without failing the check.'
+        type: boolean
+        required: false
+        default: true
+      runs-on:
+        description: Runner label.
+        type: string
+        required: false
+        default: 'ubuntu-latest'
+      timeout-minutes:
+        description: Job timeout.
+        type: number
+        required: false
+        default: 30
+
+    outputs:
+      pass-rate:
+        description: The pass rate percentage.
+        value: ${{ jobs.eval.outputs.pass-rate }}
+      passed:
+        description: '`true` if the suite met the threshold and regression budget.'
+        value: ${{ jobs.eval.outputs.passed }}
+      cost-usd:
+        description: Reported cost, when available.
+        value: ${{ jobs.eval.outputs.cost-usd }}
+
+permissions:
+  contents: read
+
+jobs:
+  eval:
+    name: Eval
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      pull-requests: write
+      actions: read
+    outputs:
+      pass-rate: ${{ steps.eval.outputs.pass-rate }}
+      passed: ${{ steps.eval.outputs.passed }}
+      cost-usd: ${{ steps.eval.outputs.cost-usd }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Set up Node
+        if: ${{ inputs.node }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Set up Python
+        if: ${{ inputs.python }}
+        uses: ./.toolkit/actions/setup-python
+        with:
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: Resolve provider keys
+        id: keys
+        env:
+          PROVIDER_KEYS: ${{ inputs.provider-keys }}
+          SECRETS_JSON: ${{ toJSON(secrets) }}
+        run: |
+          set -euo pipefail
+          # These go to the eval action as an env-vars block rather than into this job's
+          # environment, so they are scoped to the one step that needs them.
+          out=''
+          if [ -n "$PROVIDER_KEYS" ]; then
+            while IFS= read -r line; do
+              [ -n "$line" ] || continue
+              case "$line" in \#*) continue ;; esac
+              key="${line%%=*}"
+              src="${line#*=}"
+              [ "$src" = "$line" ] && src="$key"
+              value="$(jq -r --arg n "$src" '.[$n] // ""' <<< "$SECRETS_JSON")"
+              if [ -z "$value" ]; then
+                echo "::warning::Provider key '$key' maps to secret '$src', which is unset."
+                continue
+              fi
+              echo "::add-mask::$value"
+              out="${out}${key}=${value}"$'\n'
+              echo "Resolved $key"
+            done <<< "$PROVIDER_KEYS"
+          fi
+          {
+            echo 'env_vars<<__ATK_EOF__'
+            printf '%s' "$out"
+            echo '__ATK_EOF__'
+          } >> "$GITHUB_OUTPUT"
+
+      # Pull the last published baseline so the PR can be measured against the default
+      # branch rather than against a static number nobody revisits.
+      - name: Download the baseline score
+        id: baseline
+        if: ${{ inputs.baseline-file == '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: ai-eval-baseline
+          path: /tmp/atk-baseline
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+
+      - name: Resolve the baseline path
+        id: baseline-path
+        env:
+          EXPLICIT: ${{ inputs.baseline-file }}
+          DOWNLOADED: ${{ steps.baseline.outcome }}
+        run: |
+          set -euo pipefail
+          if [ -n "$EXPLICIT" ]; then
+            path="$EXPLICIT"
+          elif [ "$DOWNLOADED" = "success" ] && [ -f /tmp/atk-baseline/baseline.json ]; then
+            path=/tmp/atk-baseline/baseline.json
+            echo "Using the published baseline: $(cat "$path")"
+          else
+            path=''
+            echo "::notice::No baseline available — gating on the absolute threshold only."
+          fi
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+
+      - name: Run the eval suite
+        id: eval
+        uses: ./.toolkit/actions/llm-eval
+        with:
+          runner: ${{ inputs.runner }}
+          config: ${{ inputs.config }}
+          command: ${{ inputs.command }}
+          results-file: ${{ inputs.results-file }}
+          pass-rate-jq: ${{ inputs.pass-rate-jq }}
+          threshold: ${{ inputs.threshold }}
+          baseline-file: ${{ steps.baseline-path.outputs.path }}
+          max-regression: ${{ inputs.max-regression }}
+          max-cost-usd: ${{ inputs.max-cost-usd }}
+          concurrency: ${{ inputs.concurrency-limit }}
+          cache: ${{ inputs.cache }}
+          working-directory: ${{ inputs.working-directory }}
+          env-vars: ${{ steps.keys.outputs.env_vars }}
+          fail-on-threshold: ${{ inputs.fail-on-threshold }}
+
+      - name: Comment the score
+        if: ${{ always() && inputs.comment-on-pr && github.event_name == 'pull_request' && steps.eval.outputs.comment-body-file != '' }}
+        uses: ./.toolkit/actions/pr-comment
+        with:
+          marker: ai-eval
+          body-file: ${{ steps.eval.outputs.comment-body-file }}
+
+      - name: Upload the raw results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ai-eval-results-${{ github.run_id }}
+          path: ${{ inputs.working-directory }}/${{ inputs.results-file }}
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Publish the new baseline
+        # Only from a passing run, and only where the caller opted in — publishing from a
+        # PR would let a regression overwrite the baseline it should be measured against.
+        if: ${{ inputs.publish-baseline && steps.eval.outputs.passed == 'true' }}
+        env:
+          PASS_RATE: ${{ steps.eval.outputs.pass-rate }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/atk-new-baseline
+          jq -n --argjson r "$PASS_RATE" --arg sha "$SHA" \
+            '{ pass_rate: $r, commit: $sha }' > /tmp/atk-new-baseline/baseline.json
+          cat /tmp/atk-new-baseline/baseline.json
+
+      - name: Upload the new baseline
+        if: ${{ inputs.publish-baseline && steps.eval.outputs.passed == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ai-eval-baseline
+          path: /tmp/atk-new-baseline/baseline.json
+          retention-days: 90
+          overwrite: true

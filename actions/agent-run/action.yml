@@ -1,0 +1,348 @@
+# Run one agentic coding task with whichever provider the repo is configured for.
+#
+# This is the provider seam for every agentic workflow in the toolkit: workflows call this
+# action instead of naming a vendor, so adding or swapping an agent is one file rather than
+# five workflows. It is the actions-toolkit descendant of agentic-toolkit's `agent-run`,
+# extended with an OpenRouter-backed provider.
+#
+#   claude (default) → Claude Code via anthropics/claude-code-action
+#                      credential: claude-code-oauth-token, or anthropic-api-key
+#   openai           → OpenAI Codex CLI, headless (`codex exec`)
+#                      credential: openai-api-key
+#   gemini           → Google Gemini CLI, headless (`gemini --prompt`)
+#                      credential: gemini-api-key
+#   aider            → Aider against any OpenRouter model — the "bring your own model"
+#                      path. One key, any frontier or open-weights model, and it swaps
+#                      without touching the workflow.
+#                      credential: openrouter-api-key (or openai-api-key + base-url)
+#
+# Aliases: anthropic → claude; codex / openai-codex → openai; google / google-gemini →
+# gemini; openrouter → aider. Empty means claude.
+#
+# ── Why full-auto is safe here ────────────────────────────────────────────────────────
+# Headless CI must never block on a tool-approval prompt, so every provider runs in its
+# unattended mode (Claude `bypassPermissions`, Codex bypass-approvals, Gemini `--yolo`,
+# Aider `--yes-always`). That is acceptable *only* because the boundary is the ephemeral
+# runner and the job's `permissions:` block — not the agent's own judgment. Give the job
+# the narrowest token that lets it do its work, and never run this on `pull_request_target`
+# with untrusted input. See docs/SECURITY.md.
+#
+# ── The safety net ────────────────────────────────────────────────────────────────────
+# Claude Code drives git itself. Codex, Gemini, and Aider are backed by a deterministic
+# fallback: if `push-branch` is set and the agent left commits or a dirty tree behind, this
+# action commits, pushes, and (when `open-pr`) opens the PR. Every branch of it is
+# idempotent, so it is a no-op when the agent already did the work.
+
+name: Run coding agent
+description: Run an agentic coding task with Claude Code, Codex, Gemini, or Aider/OpenRouter
+
+inputs:
+  prompt:
+    description: The task for the agent. Passed to the provider verbatim.
+    required: true
+  provider:
+    description: 'claude | openai | gemini | aider (aliases accepted). Empty means claude.'
+    required: false
+    default: ''
+  model:
+    description: Explicit model override. Empty falls back to `default-model` or the CLI default.
+    required: false
+    default: ''
+  default-model:
+    description: Fallback model tier when `model` is empty. Claude and Aider honour this.
+    required: false
+    default: 'sonnet'
+  max-turns:
+    description: Cap on agent loop iterations. Honoured by Claude, Gemini, and Aider.
+    required: false
+    default: ''
+
+  # ── Credentials — pass only what your provider needs ────────────────────────
+  claude-code-oauth-token:
+    description: 'Claude Code OAuth token (`claude setup-token`).'
+    required: false
+    default: ''
+  anthropic-api-key:
+    description: Anthropic API key. Alternative to the OAuth token.
+    required: false
+    default: ''
+  openai-api-key:
+    description: OpenAI API key, for the Codex provider or an OpenAI-backed Aider.
+    required: false
+    default: ''
+  gemini-api-key:
+    description: Google AI Studio API key, for the Gemini provider.
+    required: false
+    default: ''
+  openrouter-api-key:
+    description: OpenRouter API key, for the Aider provider.
+    required: false
+    default: ''
+  github-token:
+    description: Token exposed to the agent as `GH_TOKEN` so it can use the `gh` CLI.
+    required: true
+
+  # ── Deterministic safety net (non-Claude providers) ─────────────────────────
+  push-branch:
+    description: Branch to commit and push the agent's changes to. Empty disables the safety net.
+    required: false
+    default: ''
+  commit-message:
+    description: Commit message for the safety-net commit.
+    required: false
+    default: 'chore(agent): apply agent changes'
+  open-pr:
+    description: 'true to open a PR from `push-branch` when the agent did not open one.'
+    required: false
+    default: 'false'
+  pr-title:
+    description: Title for the safety-net PR.
+    required: false
+    default: ''
+  pr-body:
+    description: 'Body for the safety-net PR. Include `Closes #NNN` to auto-close an issue.'
+    required: false
+    default: ''
+  pr-labels:
+    description: Comma-separated labels to apply to the safety-net PR.
+    required: false
+    default: ''
+
+outputs:
+  provider:
+    description: The resolved provider that ran.
+    value: ${{ steps.cfg.outputs.provider }}
+  model:
+    description: The resolved model, or empty when the CLI default was used.
+    value: ${{ steps.cfg.outputs.model }}
+  changed:
+    description: '`true` if the run produced commits or pushed a branch.'
+    value: ${{ steps.safety-net.outputs.changed || 'unknown' }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve provider configuration
+      id: cfg
+      shell: bash
+      env:
+        IN_PROVIDER: ${{ inputs.provider }}
+        IN_MODEL: ${{ inputs.model }}
+        IN_DEFAULT_MODEL: ${{ inputs.default-model }}
+        IN_MAX_TURNS: ${{ inputs.max-turns }}
+        HAS_CLAUDE_CRED: ${{ (inputs.claude-code-oauth-token != '' || inputs.anthropic-api-key != '') && 'yes' || 'no' }}
+        HAS_OPENAI_CRED: ${{ inputs.openai-api-key != '' && 'yes' || 'no' }}
+        HAS_GEMINI_CRED: ${{ inputs.gemini-api-key != '' && 'yes' || 'no' }}
+        HAS_AIDER_CRED: ${{ (inputs.openrouter-api-key != '' || inputs.openai-api-key != '') && 'yes' || 'no' }}
+      run: |
+        set -euo pipefail
+
+        case "$(printf '%s' "${IN_PROVIDER:-}" | tr '[:upper:]' '[:lower:]')" in
+          ''|claude|anthropic)          provider=claude ;;
+          openai|openai-codex|codex)    provider=openai ;;
+          gemini|google|google-gemini)  provider=gemini ;;
+          aider|openrouter)             provider=aider ;;
+          *)
+            echo "::error::provider='${IN_PROVIDER}' is not supported. Use claude, openai, gemini, or aider."
+            exit 1 ;;
+        esac
+
+        # Claude model names are tier aliases with a meaningful cost/quality default per
+        # job, so the default-model fallback is useful there. Codex and Gemini track their
+        # own current defaults, so we only pass --model when one is set explicitly — that
+        # way an upstream model rename can't break the repo.
+        model="${IN_MODEL:-}"
+        if [ -z "$model" ] && [ "$provider" = "claude" ]; then
+          model="${IN_DEFAULT_MODEL:-}"
+        fi
+        # Aider needs a fully-qualified model id; a bare tier alias is meaningless to it.
+        if [ -z "$model" ] && [ "$provider" = "aider" ]; then
+          model='openrouter/anthropic/claude-sonnet-5'
+          echo "::notice::No model given for aider — defaulting to $model."
+        fi
+
+        case "$provider" in
+          claude) cred="$HAS_CLAUDE_CRED"; hint='claude-code-oauth-token (or anthropic-api-key)' ;;
+          openai) cred="$HAS_OPENAI_CRED"; hint='openai-api-key' ;;
+          gemini) cred="$HAS_GEMINI_CRED"; hint='gemini-api-key' ;;
+          aider)  cred="$HAS_AIDER_CRED";  hint='openrouter-api-key (or openai-api-key)' ;;
+        esac
+        if [ "$cred" != "yes" ]; then
+          echo "::error::Provider '${provider}' is selected but its credential is not set. Pass ${hint}."
+          exit 1
+        fi
+
+        # Recorded before the agent runs so the safety net can tell "produced commits"
+        # from "changed nothing" without guessing.
+        base_sha="$(git rev-parse HEAD 2>/dev/null || echo '')"
+
+        {
+          echo "provider=$provider"
+          echo "model=$model"
+          echo "base_sha=$base_sha"
+          echo "claude_args=--permission-mode bypassPermissions${model:+ --model $model}${IN_MAX_TURNS:+ --max-turns $IN_MAX_TURNS}"
+        } >> "$GITHUB_OUTPUT"
+
+        echo "Provider: $provider | model: ${model:-<provider default>} | max-turns: ${IN_MAX_TURNS:-<none>}"
+
+    # ── CLAUDE ────────────────────────────────────────────────────────────────
+    # `--permission-mode` must come through claude_args: it is the only path that reaches
+    # the SDK's permissionMode. A `settings:` block alone does not reliably set it, and a
+    # committed .claude/settings*.json can override it.
+    - name: Run Claude Code
+      if: steps.cfg.outputs.provider == 'claude'
+      uses: anthropics/claude-code-action@v1
+      with:
+        claude_code_oauth_token: ${{ inputs.claude-code-oauth-token }}
+        anthropic_api_key: ${{ inputs.anthropic-api-key }}
+        claude_args: ${{ steps.cfg.outputs.claude_args }}
+        settings: |
+          {
+            "permissions": {
+              "defaultMode": "bypassPermissions"
+            }
+          }
+        additional_permissions: |
+          actions: read
+        prompt: ${{ inputs.prompt }}
+
+    # ── Shared toolchain for the CLI-based providers ──────────────────────────
+    - name: Set up Node
+      if: steps.cfg.outputs.provider == 'openai' || steps.cfg.outputs.provider == 'gemini'
+      uses: actions/setup-node@v7
+      with:
+        node-version: '22'
+
+    - name: Set up Python
+      if: steps.cfg.outputs.provider == 'aider'
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.12'
+
+    - name: Configure git identity
+      if: steps.cfg.outputs.provider != 'claude'
+      shell: bash
+      run: |
+        set -euo pipefail
+        git config user.name  "actions-toolkit[bot]"
+        git config user.email "actions-toolkit[bot]@users.noreply.github.com"
+
+    # ── OPENAI (Codex CLI) ────────────────────────────────────────────────────
+    # The prompt goes in on stdin (`codex exec -`) so no issue or comment text is ever
+    # interpolated into a shell command line.
+    - name: Run OpenAI Codex
+      if: steps.cfg.outputs.provider == 'openai'
+      shell: bash
+      env:
+        AGENT_PROMPT: ${{ inputs.prompt }}
+        AGENT_MODEL: ${{ steps.cfg.outputs.model }}
+        OPENAI_API_KEY: ${{ inputs.openai-api-key }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        npm install -g @openai/codex
+
+        args=(exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check)
+        [ -n "${AGENT_MODEL:-}" ] && args+=(--model "$AGENT_MODEL")
+
+        printf '%s' "$AGENT_PROMPT" | codex "${args[@]}" -
+
+    # ── GOOGLE (Gemini CLI) ───────────────────────────────────────────────────
+    - name: Run Google Gemini
+      if: steps.cfg.outputs.provider == 'gemini'
+      shell: bash
+      env:
+        AGENT_PROMPT: ${{ inputs.prompt }}
+        AGENT_MODEL: ${{ steps.cfg.outputs.model }}
+        AGENT_MAX_TURNS: ${{ inputs.max-turns }}
+        GEMINI_API_KEY: ${{ inputs.gemini-api-key }}
+        GOOGLE_API_KEY: ${{ inputs.gemini-api-key }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        npm install -g @google/gemini-cli
+
+        args=(--yolo --prompt "$AGENT_PROMPT")
+        [ -n "${AGENT_MODEL:-}" ]     && args+=(--model "$AGENT_MODEL")
+        [ -n "${AGENT_MAX_TURNS:-}" ] && args+=(--max-session-turns "$AGENT_MAX_TURNS")
+
+        gemini "${args[@]}"
+
+    # ── AIDER (any OpenRouter model) ──────────────────────────────────────────
+    # Aider commits each edit itself, so `--no-auto-commits` is deliberately NOT passed —
+    # its commits are what the safety net detects and pushes. The prompt goes in via
+    # `--message-file` so nothing lands on the command line.
+    - name: Run Aider
+      if: steps.cfg.outputs.provider == 'aider'
+      shell: bash
+      env:
+        AGENT_PROMPT: ${{ inputs.prompt }}
+        AGENT_MODEL: ${{ steps.cfg.outputs.model }}
+        AGENT_MAX_TURNS: ${{ inputs.max-turns }}
+        OPENROUTER_API_KEY: ${{ inputs.openrouter-api-key }}
+        OPENAI_API_KEY: ${{ inputs.openai-api-key }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        python -m pip install --quiet --upgrade aider-install
+        aider-install
+
+        printf '%s' "$AGENT_PROMPT" > /tmp/atk-agent-prompt.txt
+
+        args=(--model "$AGENT_MODEL" --yes-always --no-check-update --no-analytics
+              --message-file /tmp/atk-agent-prompt.txt)
+        [ -n "${AGENT_MAX_TURNS:-}" ] && args+=(--max-reflections "$AGENT_MAX_TURNS")
+
+        aider "${args[@]}"
+
+    # ── Safety net: commit, push, and open the PR if the agent didn't ─────────
+    - name: Commit, push, and open PR (if needed)
+      id: safety-net
+      if: ${{ steps.cfg.outputs.provider != 'claude' && inputs.push-branch != '' }}
+      shell: bash
+      env:
+        PUSH_BRANCH: ${{ inputs.push-branch }}
+        COMMIT_MESSAGE: ${{ inputs.commit-message }}
+        OPEN_PR: ${{ inputs.open-pr }}
+        PR_TITLE: ${{ inputs.pr-title }}
+        PR_BODY: ${{ inputs.pr-body }}
+        PR_LABELS: ${{ inputs.pr-labels }}
+        BASE_SHA: ${{ steps.cfg.outputs.base_sha }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+
+        # The agent may have switched branches itself; land on the intended one either way.
+        if [ "$(git rev-parse --abbrev-ref HEAD)" != "$PUSH_BRANCH" ]; then
+          git checkout -B "$PUSH_BRANCH"
+        fi
+
+        if [ -n "$(git status --porcelain)" ]; then
+          git add -A
+          git commit -m "$COMMIT_MESSAGE"
+          echo "Committed the agent's uncommitted changes."
+        fi
+
+        if [ "$(git rev-parse HEAD)" = "$BASE_SHA" ]; then
+          echo "No commits produced — the agent changed nothing. Nothing to push."
+          echo "changed=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        git push --set-upstream origin "$PUSH_BRANCH"
+        echo "changed=true" >> "$GITHUB_OUTPUT"
+
+        [ "$OPEN_PR" = "true" ] || exit 0
+
+        if [ -n "$(gh pr list --head "$PUSH_BRANCH" --state open --json number --jq '.[].number')" ]; then
+          echo "A PR for $PUSH_BRANCH is already open — leaving it alone."
+          exit 0
+        fi
+
+        gh pr create --head "$PUSH_BRANCH" --title "$PR_TITLE" --body "$PR_BODY"
+
+        if [ -n "$PR_LABELS" ]; then
+          # A missing label shouldn't fail a run that already produced a PR.
+          gh pr edit "$PUSH_BRANCH" --add-label "$PR_LABELS" ||
+            echo "::warning::Could not apply labels '$PR_LABELS'."
+        fi

@@ -1,0 +1,222 @@
+# Supabase deploys: migrations, Edge Functions, and project config.
+#
+# The intended pairing is two calls. On a PR, `dry-run: true` posts the pending migrations
+# as a comment so a schema change gets reviewed like code. On merge, the same workflow runs
+# for real. Database migrations are the least reversible thing most apps do — reviewing the
+# diff before it lands is worth the extra job.
+#
+# Usage:
+#   jobs:
+#     plan:
+#       if: github.event_name == 'pull_request'
+#       uses: patrickisgreat/actions-toolkit/.github/workflows/deploy-supabase.yml@v1
+#       with: { dry-run: true }
+#       secrets: inherit
+#
+#     apply:
+#       if: github.ref == 'refs/heads/main'
+#       uses: patrickisgreat/actions-toolkit/.github/workflows/deploy-supabase.yml@v1
+#       with: { functions: all, environment-name: production }
+#       secrets: inherit
+
+name: Deploy Supabase
+
+on:
+  workflow_call:
+    inputs:
+      migrate:
+        description: 'true to run `supabase db push`.'
+        type: boolean
+        required: false
+        default: true
+      functions:
+        description: '`all`, a comma-separated list of function names, or empty to skip.'
+        type: string
+        required: false
+        default: ''
+      config:
+        description: 'true to push `supabase/config.toml`.'
+        type: boolean
+        required: false
+        default: false
+      seed:
+        description: SQL file applied after migrations. Must be idempotent.
+        type: string
+        required: false
+        default: ''
+      dry-run:
+        description: 'true to report pending migrations without applying anything.'
+        type: boolean
+        required: false
+        default: false
+      no-verify-jwt:
+        description: 'true to deploy functions with JWT verification off.'
+        type: boolean
+        required: false
+        default: false
+      function-secrets-map:
+        description: |
+          Newline-separated `FUNCTION_ENV_NAME=GH_SECRET_NAME` mappings set on the project
+          before functions deploy.
+        type: string
+        required: false
+        default: ''
+      working-directory:
+        description: Directory containing `supabase/`.
+        type: string
+        required: false
+        default: '.'
+      environment-name:
+        description: GitHub Environment to deploy through.
+        type: string
+        required: false
+        default: ''
+      comment-on-pr:
+        description: 'true to post the migration plan/result as a sticky PR comment.'
+        type: boolean
+        required: false
+        default: true
+      notify:
+        description: 'true to send a Slack/Discord notification.'
+        type: boolean
+        required: false
+        default: true
+      runs-on:
+        description: Runner label.
+        type: string
+        required: false
+        default: 'ubuntu-latest'
+      timeout-minutes:
+        description: Job timeout.
+        type: number
+        required: false
+        default: 20
+
+    secrets:
+      SUPABASE_ACCESS_TOKEN:
+        description: Supabase account access token.
+        required: true
+      SUPABASE_PROJECT_REF:
+        description: Target project ref.
+        required: true
+      SUPABASE_DB_PASSWORD:
+        description: Database password, required for migrations.
+        required: false
+      SLACK_WEBHOOK:
+        required: false
+      DISCORD_WEBHOOK:
+        required: false
+
+    outputs:
+      migrations-applied:
+        description: Migration versions applied.
+        value: ${{ jobs.deploy.outputs.migrations }}
+      functions-deployed:
+        description: Function names deployed.
+        value: ${{ jobs.deploy.outputs.functions }}
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: ${{ inputs.dry-run && 'Plan' || 'Deploy' }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    environment:
+      name: ${{ inputs.environment-name }}
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      migrations: ${{ steps.deploy.outputs.migrations-applied }}
+      functions: ${{ steps.deploy.outputs.functions-deployed }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Resolve function secrets
+        id: fn-secrets
+        env:
+          SECRETS_MAP: ${{ inputs.function-secrets-map }}
+          SECRETS_JSON: ${{ toJSON(secrets) }}
+        run: |
+          set -euo pipefail
+          out=''
+          if [ -n "$SECRETS_MAP" ]; then
+            while IFS= read -r line; do
+              [ -n "$line" ] || continue
+              case "$line" in \#*) continue ;; esac
+              key="${line%%=*}"
+              src="${line#*=}"
+              [ "$src" = "$line" ] && src="$key"
+              value="$(jq -r --arg n "$src" '.[$n] // ""' <<< "$SECRETS_JSON")"
+              if [ -z "$value" ]; then
+                echo "::warning::Function secret '$key' maps to '$src', which is unset."
+                continue
+              fi
+              echo "::add-mask::$value"
+              out="${out}${key}=${value}"$'\n'
+              echo "Staged $key"
+            done <<< "$SECRETS_MAP"
+          fi
+          {
+            echo 'secrets<<__ATK_EOF__'
+            printf '%s' "$out"
+            echo '__ATK_EOF__'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to Supabase
+        id: deploy
+        uses: ./.toolkit/actions/deploy-supabase
+        with:
+          access-token: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          project-ref: ${{ secrets.SUPABASE_PROJECT_REF }}
+          db-password: ${{ secrets.SUPABASE_DB_PASSWORD }}
+          migrate: ${{ inputs.migrate }}
+          functions: ${{ inputs.functions }}
+          function-secrets: ${{ steps.fn-secrets.outputs.secrets }}
+          no-verify-jwt: ${{ inputs.no-verify-jwt }}
+          config: ${{ inputs.config }}
+          seed: ${{ inputs.seed }}
+          dry-run: ${{ inputs.dry-run }}
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: Comment the migration summary
+        if: ${{ always() && inputs.comment-on-pr && github.event_name == 'pull_request' }}
+        uses: ./.toolkit/actions/pr-comment
+        with:
+          marker: deploy-supabase
+          body: |
+            ### 🗄️ Supabase — ${{ inputs.dry-run && 'pending changes' || 'applied' }}
+
+            **Status:** ${{ job.status }}
+
+            <details><summary>Migrations</summary>
+
+            ```
+            ${{ steps.deploy.outputs.migrations-applied || 'none reported — see the job log for the full plan' }}
+            ```
+
+            </details>
+
+            **Functions deployed:** `${{ steps.deploy.outputs.functions-deployed || 'none' }}`
+
+            _Commit `${{ github.sha }}`._
+
+      - name: Notify
+        if: ${{ always() && inputs.notify && !inputs.dry-run }}
+        uses: ./.toolkit/actions/notify
+        with:
+          status: ${{ job.status }}
+          title: Supabase deploy — ${{ job.status }}
+          slack-webhook: ${{ secrets.SLACK_WEBHOOK }}
+          discord-webhook: ${{ secrets.DISCORD_WEBHOOK }}
+          fields: |
+            {"Functions":"${{ steps.deploy.outputs.functions-deployed || 'none' }}","Ref":"${{ github.ref_name }}"}

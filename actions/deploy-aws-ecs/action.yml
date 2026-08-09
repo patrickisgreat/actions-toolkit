@@ -1,0 +1,210 @@
+# Roll a new image onto an ECS service.
+#
+# The task definition is fetched live from ECS rather than read from a committed JSON file.
+# That matters: a committed file drifts the moment anyone changes anything in the console or
+# via Terraform, and deploying it silently reverts those changes. Fetching the active
+# revision, swapping only the image (and any overrides you ask for), and registering a new
+# revision means a deploy changes exactly one thing.
+#
+# Set `task-definition-file` if you genuinely want the committed file to be the source of
+# truth — appropriate when Terraform owns the definition and CI only bumps the tag.
+#
+# Authenticate with `aws-auth` first. Requires `wait-for-stability` time budget; the default
+# 10 minutes covers a rolling deploy of a small service with health checks.
+
+name: Deploy to Amazon ECS
+description: Register a new ECS task definition with an updated image and roll the service
+
+inputs:
+  cluster:
+    description: ECS cluster name or ARN.
+    required: true
+  service:
+    description: ECS service name.
+    required: true
+  image:
+    description: 'Image to deploy. Use an immutable digest ref (`repo@sha256:…`) where possible.'
+    required: true
+  container-name:
+    description: Container in the task definition to update. Empty uses the first container.
+    required: false
+    default: ''
+  task-definition-file:
+    description: |
+      Path to a task-definition JSON to use as the base. Empty (default) fetches the
+      service's currently active revision from ECS.
+    required: false
+    default: ''
+  task-definition-family:
+    description: Family to describe when no service exists yet. Empty uses the service's family.
+    required: false
+    default: ''
+  environment-variables:
+    description: Newline-separated `KEY=value` env vars merged into the container definition.
+    required: false
+    default: ''
+  secrets:
+    description: |
+      Newline-separated `KEY=arn` pairs mapped to the container's `secrets` (Secrets Manager
+      or SSM Parameter Store ARNs). These are references, not values.
+    required: false
+    default: ''
+  desired-count:
+    description: Override the service's desired task count. Empty leaves it unchanged.
+    required: false
+    default: ''
+  wait-for-stability:
+    description: 'true to block until the service reaches a steady state.'
+    required: false
+    default: 'true'
+  wait-timeout-minutes:
+    description: How long to wait for stability before failing.
+    required: false
+    default: '10'
+  force-new-deployment:
+    description: 'true to force a new deployment even when the task definition is unchanged.'
+    required: false
+    default: 'false'
+  codedeploy-appspec:
+    description: Path to an AppSpec file, for blue/green services managed by CodeDeploy.
+    required: false
+    default: ''
+
+outputs:
+  task-definition-arn:
+    description: ARN of the task definition revision that was registered and deployed.
+    value: ${{ steps.deploy.outputs.task-definition-arn }}
+  revision:
+    description: The new task definition revision number.
+    value: ${{ steps.summary.outputs.revision }}
+
+runs:
+  using: composite
+  steps:
+    - name: Fetch the base task definition
+      id: render
+      shell: bash
+      env:
+        CLUSTER: ${{ inputs.cluster }}
+        SERVICE: ${{ inputs.service }}
+        TD_FILE: ${{ inputs.task-definition-file }}
+        TD_FAMILY: ${{ inputs.task-definition-family }}
+        CONTAINER_NAME: ${{ inputs.container-name }}
+        ENV_VARS: ${{ inputs.environment-variables }}
+        TD_SECRETS: ${{ inputs.secrets }}
+      run: |
+        set -euo pipefail
+
+        if [ -n "$TD_FILE" ]; then
+          [ -f "$TD_FILE" ] || { echo "::error::task-definition-file '$TD_FILE' does not exist."; exit 1; }
+          cp "$TD_FILE" /tmp/atk-taskdef-base.json
+          echo "Using committed task definition $TD_FILE"
+        else
+          if [ -n "$TD_FAMILY" ]; then
+            family="$TD_FAMILY"
+          else
+            family="$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+              --query 'services[0].taskDefinition' --output text)"
+            if [ -z "$family" ] || [ "$family" = "None" ]; then
+              echo "::error::Service '$SERVICE' not found in cluster '$CLUSTER', and no task-definition-family given."
+              exit 1
+            fi
+          fi
+          aws ecs describe-task-definition --task-definition "$family" \
+            --query 'taskDefinition' --output json > /tmp/atk-taskdef-base.json
+          echo "Fetched active task definition for $family"
+        fi
+
+        # describe-task-definition returns read-only fields that register-task-definition
+        # rejects. Strip them here rather than letting the register call fail.
+        jq 'del(
+              .taskDefinitionArn, .revision, .status, .requiresAttributes,
+              .compatibilities, .registeredAt, .registeredBy, .deregisteredAt
+            )' /tmp/atk-taskdef-base.json > /tmp/atk-taskdef.json
+
+        container="$CONTAINER_NAME"
+        if [ -z "$container" ]; then
+          container="$(jq -r '.containerDefinitions[0].name' /tmp/atk-taskdef.json)"
+          echo "::notice::No container-name given — targeting the first container, '$container'."
+        fi
+        if ! jq -e --arg n "$container" '.containerDefinitions[] | select(.name == $n)' /tmp/atk-taskdef.json >/dev/null; then
+          echo "::error::Container '$container' is not in the task definition. Available: $(jq -r '[.containerDefinitions[].name] | join(", ")' /tmp/atk-taskdef.json)"
+          exit 1
+        fi
+
+        # Merge env vars and secret references into just that container, preserving any
+        # existing entries not being overridden.
+        if [ -n "$ENV_VARS" ]; then
+          jq -Rn '[inputs | select(length > 0 and (startswith("#") | not)) |
+                   { name: (. | split("=")[0]), value: (. | sub("^[^=]*=";"")) }]' <<< "$ENV_VARS" \
+            > /tmp/atk-env.json
+          jq --arg n "$container" --slurpfile new /tmp/atk-env.json '
+            .containerDefinitions |= map(
+              if .name == $n then
+                .environment = (((.environment // []) + $new[0])
+                  | group_by(.name) | map(last))
+              else . end)' /tmp/atk-taskdef.json > /tmp/atk-taskdef.next.json
+          mv /tmp/atk-taskdef.next.json /tmp/atk-taskdef.json
+          echo "Merged $(jq length /tmp/atk-env.json) environment variables."
+        fi
+
+        if [ -n "$TD_SECRETS" ]; then
+          jq -Rn '[inputs | select(length > 0 and (startswith("#") | not)) |
+                   { name: (. | split("=")[0]), valueFrom: (. | sub("^[^=]*=";"")) }]' <<< "$TD_SECRETS" \
+            > /tmp/atk-secrets.json
+          jq --arg n "$container" --slurpfile new /tmp/atk-secrets.json '
+            .containerDefinitions |= map(
+              if .name == $n then
+                .secrets = (((.secrets // []) + $new[0])
+                  | group_by(.name) | map(last))
+              else . end)' /tmp/atk-taskdef.json > /tmp/atk-taskdef.next.json
+          mv /tmp/atk-taskdef.next.json /tmp/atk-taskdef.json
+          echo "Merged $(jq length /tmp/atk-secrets.json) secret references."
+        fi
+
+        echo "container=$container" >> "$GITHUB_OUTPUT"
+
+    - name: Set the image
+      id: task-def
+      uses: aws-actions/amazon-ecs-render-task-definition@v1
+      with:
+        task-definition: /tmp/atk-taskdef.json
+        container-name: ${{ steps.render.outputs.container }}
+        image: ${{ inputs.image }}
+
+    - name: Deploy the service
+      id: deploy
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+      with:
+        task-definition: ${{ steps.task-def.outputs.task-definition }}
+        service: ${{ inputs.service }}
+        cluster: ${{ inputs.cluster }}
+        desired-count: ${{ inputs.desired-count }}
+        wait-for-service-stability: ${{ inputs.wait-for-stability }}
+        wait-for-minutes: ${{ inputs.wait-timeout-minutes }}
+        force-new-deployment: ${{ inputs.force-new-deployment }}
+        codedeploy-appspec: ${{ inputs.codedeploy-appspec }}
+
+    - name: Summarize
+      id: summary
+      shell: bash
+      env:
+        CLUSTER: ${{ inputs.cluster }}
+        SERVICE: ${{ inputs.service }}
+        IMAGE: ${{ inputs.image }}
+        TD_ARN: ${{ steps.deploy.outputs.task-definition-arn }}
+      run: |
+        set -euo pipefail
+        # The revision is the trailing `:N` of the task definition ARN.
+        revision="${TD_ARN##*:}"
+        echo "revision=$revision" >> "$GITHUB_OUTPUT"
+        {
+          echo "### 🚢 ECS deploy"
+          echo
+          echo "| | |"
+          echo "|---|---|"
+          echo "| Cluster | \`${CLUSTER}\` |"
+          echo "| Service | \`${SERVICE}\` |"
+          echo "| Image | \`${IMAGE}\` |"
+          echo "| Task definition | \`${TD_ARN}\` |"
+        } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,150 @@
+# Report a pipeline outcome to the job summary and, optionally, Slack or Discord.
+#
+# Deploy and release pipelines all want the same thing: a compact status card with a link
+# back to the run. Doing it here means one payload shape across every pipeline and no
+# webhook URL pasted into five workflows.
+#
+# Every destination is optional and silently skipped when its URL is empty, so the same
+# step works in a repo that has Slack wired up and one that doesn't. The job summary is on
+# by default because it costs nothing and is always visible.
+
+name: Notify
+description: Post a status card to the job summary, Slack, and/or Discord
+
+inputs:
+  status:
+    description: 'success | failure | cancelled | warning | info. Drives the colour and icon.'
+    required: false
+    default: 'success'
+  title:
+    description: Headline for the notification.
+    required: true
+  text:
+    description: Markdown body. Slack renders mrkdwn; Discord and the summary render Markdown.
+    required: false
+    default: ''
+  fields:
+    description: |
+      JSON object of short key/value pairs rendered as a table, e.g.
+      `{"Environment":"prod","Version":"v1.4.0"}`.
+    required: false
+    default: '{}'
+  url:
+    description: Primary link (deployment URL, release page). Empty links to the run.
+    required: false
+    default: ''
+  slack-webhook:
+    description: Slack incoming-webhook URL. Empty disables Slack.
+    required: false
+    default: ''
+  discord-webhook:
+    description: Discord webhook URL. Empty disables Discord.
+    required: false
+    default: ''
+  summary:
+    description: 'true to append the card to the GitHub job summary.'
+    required: false
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - name: Build and send
+      shell: bash
+      env:
+        STATUS: ${{ inputs.status }}
+        TITLE: ${{ inputs.title }}
+        TEXT: ${{ inputs.text }}
+        FIELDS: ${{ inputs.fields }}
+        LINK: ${{ inputs.url }}
+        SLACK_WEBHOOK: ${{ inputs.slack-webhook }}
+        DISCORD_WEBHOOK: ${{ inputs.discord-webhook }}
+        WRITE_SUMMARY: ${{ inputs.summary }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        REPO: ${{ github.repository }}
+        REF_NAME: ${{ github.ref_name }}
+        SHA: ${{ github.sha }}
+      run: |
+        set -euo pipefail
+
+        case "$STATUS" in
+          success)   icon='✅'; color='#2ea043'; decimal=3055211 ;;
+          failure)   icon='❌'; color='#d1242f'; decimal=13706799 ;;
+          cancelled) icon='⚪'; color='#6e7781'; decimal=7239297 ;;
+          warning)   icon='⚠️'; color='#bf8700'; decimal=12552960 ;;
+          info|*)    icon='ℹ️'; color='#0969da'; decimal=612058 ;;
+        esac
+
+        link="${LINK:-$RUN_URL}"
+
+        if ! echo "$FIELDS" | jq -e 'type == "object"' >/dev/null 2>&1; then
+          echo "::error::Input 'fields' must be a JSON object."
+          exit 1
+        fi
+
+        # ── Job summary ──────────────────────────────────────────────────────────
+        if [ "$WRITE_SUMMARY" = "true" ]; then
+          {
+            echo "## $icon $TITLE"
+            echo
+            [ -n "$TEXT" ] && { echo "$TEXT"; echo; }
+            if [ "$(echo "$FIELDS" | jq 'length')" -gt 0 ]; then
+              echo "| | |"
+              echo "|---|---|"
+              echo "$FIELDS" | jq -r 'to_entries[] | "| **\(.key)** | \(.value) |"'
+              echo
+            fi
+            echo "[View run]($RUN_URL) · \`$REPO@${SHA:0:7}\` · \`$REF_NAME\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+        # ── Slack ────────────────────────────────────────────────────────────────
+        if [ -n "$SLACK_WEBHOOK" ]; then
+          payload="$(jq -n \
+            --arg icon "$icon" --arg title "$TITLE" --arg text "$TEXT" \
+            --arg color "$color" --arg link "$link" --arg run_url "$RUN_URL" \
+            --arg repo "$REPO" --arg ref "$REF_NAME" --arg sha "${SHA:0:7}" \
+            --argjson fields "$FIELDS" '
+            {
+              text: "\($icon) \($title)",
+              attachments: [{
+                color: $color,
+                blocks: (
+                  [{ type: "section", text: { type: "mrkdwn", text: "*\($icon) \($title)*" } }]
+                  + (if $text != "" then [{ type: "section", text: { type: "mrkdwn", text: $text } }] else [] end)
+                  + (if ($fields | length) > 0 then [{
+                      type: "section",
+                      fields: ($fields | to_entries | map({ type: "mrkdwn", text: "*\(.key)*\n\(.value)" }))
+                    }] else [] end)
+                  + [{ type: "context", elements: [
+                      { type: "mrkdwn", text: "<\($link)|Open> · <\($run_url)|Run> · `\($repo)@\($sha)` · `\($ref)`" }
+                    ] }]
+                )
+              }]
+            }')"
+          curl -fsS -X POST -H 'Content-Type: application/json' \
+            --data "$payload" "$SLACK_WEBHOOK" > /dev/null
+          echo "Sent Slack notification."
+        fi
+
+        # ── Discord ──────────────────────────────────────────────────────────────
+        if [ -n "$DISCORD_WEBHOOK" ]; then
+          payload="$(jq -n \
+            --arg icon "$icon" --arg title "$TITLE" --arg text "$TEXT" \
+            --argjson decimal "$decimal" --arg link "$link" \
+            --arg footer "$REPO@${SHA:0:7} · $REF_NAME" \
+            --argjson fields "$FIELDS" '
+            {
+              embeds: [{
+                title: "\($icon) \($title)",
+                description: (if $text != "" then $text else null end),
+                url: $link,
+                color: $decimal,
+                fields: ($fields | to_entries | map({ name: .key, value: (.value | tostring), inline: true })),
+                footer: { text: $footer }
+              }]
+            }')"
+          curl -fsS -X POST -H 'Content-Type: application/json' \
+            --data "$payload" "$DISCORD_WEBHOOK" > /dev/null
+          echo "Sent Discord notification."
+        fi

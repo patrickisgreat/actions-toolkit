@@ -1,0 +1,443 @@
+# Deploy a CloudFormation stack through a change set, so the diff is reviewable before it
+# runs.
+#
+# `aws cloudformation deploy` is one command that plans and applies in the same breath —
+# convenient, and the reason CloudFormation changes so often land unreviewed. This action
+# splits it the way `terraform plan` / `terraform apply` are split:
+#
+#   mode: change-set  → create the change set, render the resource diff, DON'T execute
+#   mode: execute     → execute a change set that already exists (by name)
+#   mode: deploy      → create and execute in one run (trunk-based, or a dispatch)
+#   mode: delete      → tear the stack down
+#
+# The interesting details, all of which are things CloudFormation gets wrong by default:
+#
+#   • **"No changes" is not a failure.** `create-change-set` completes with status FAILED
+#     when the template is identical to the deployed stack. That is a successful no-op, and
+#     treating it as an error means every re-run of an unchanged stack goes red. Detected
+#     and reported as `has-changes: false`.
+#   • **`REVIEW_IN_PROGRESS` stacks are not real stacks.** A stack left in that state by a
+#     failed first change set cannot be updated — only created. The change-set type is
+#     chosen accordingly instead of blindly using UPDATE.
+#   • **Replacement is the dangerous verb.** The rendered diff flags every resource
+#     CloudFormation intends to *replace*, because replacing an RDS instance and updating
+#     one look identical in a raw change set.
+#
+# Authenticate with `aws-auth` first.
+
+name: CloudFormation deploy
+description: Create, review, and execute a CloudFormation change set (or delete the stack)
+
+inputs:
+  stack-name:
+    description: CloudFormation stack name.
+    required: true
+  template:
+    description: |
+      Path to the template file, or an `https://s3...` URL. Required unless `mode` is
+      `execute` or `delete`.
+    required: false
+    default: ''
+  mode:
+    description: 'change-set | execute | deploy | delete'
+    required: false
+    default: 'change-set'
+  parameters:
+    description: |
+      Newline-separated `Key=Value` stack parameters. A value of `__USE_PREVIOUS__` keeps
+      the currently deployed value, which is how you avoid re-supplying secrets on update.
+    required: false
+    default: ''
+  parameters-file:
+    description: |
+      JSON parameters file in the AWS CLI shape (`[{"ParameterKey":…,"ParameterValue":…}]`).
+      Merged under `parameters`, which wins on conflict.
+    required: false
+    default: ''
+  capabilities:
+    description: |
+      Comma-separated capabilities. `CAPABILITY_IAM` / `CAPABILITY_NAMED_IAM` are required
+      when the template creates IAM resources; `CAPABILITY_AUTO_EXPAND` for macros/SAM.
+    required: false
+    default: 'CAPABILITY_IAM'
+  tags:
+    description: Newline-separated `Key=Value` tags applied to every resource in the stack.
+    required: false
+    default: ''
+  change-set-name:
+    description: Change set name. Empty generates one from the run id.
+    required: false
+    default: ''
+  role-arn:
+    description: |
+      Service role CloudFormation assumes to act on resources. Lets the deploy role be
+      narrow while CloudFormation itself holds the broad permissions.
+    required: false
+    default: ''
+  package:
+    description: |
+      'true to run `aws cloudformation package` first, uploading local artifacts referenced
+      by the template to S3. Required for SAM and for templates over 51,200 bytes.'
+    required: false
+    default: 'false'
+  s3-bucket:
+    description: Bucket for packaged artifacts. Required when `package` is true.
+    required: false
+    default: ''
+  s3-prefix:
+    description: Key prefix for packaged artifacts.
+    required: false
+    default: ''
+  termination-protection:
+    description: 'true to enable termination protection on the stack after a successful deploy.'
+    required: false
+    default: 'false'
+  fail-on-empty-changeset:
+    description: |
+      'false (default) treats "no changes" as success. Set true if an unchanged stack
+      should fail — occasionally wanted in a promotion pipeline.'
+    required: false
+    default: 'false'
+  fail-on-replacement:
+    description: |
+      'true to fail when the change set would REPLACE any resource. Worth enabling for
+      stateful production stacks, where a replacement means data loss.'
+    required: false
+    default: 'false'
+  wait-timeout-minutes:
+    description: How long to wait for stack operations to reach a terminal state.
+    required: false
+    default: '60'
+  max-comment-chars:
+    description: Truncate the rendered diff to this many characters.
+    required: false
+    default: '50000'
+
+outputs:
+  stack-id:
+    description: The stack ID.
+    value: ${{ steps.cfn.outputs.stack_id }}
+  change-set-id:
+    description: ARN of the change set that was created.
+    value: ${{ steps.cfn.outputs.change_set_id }}
+  change-set-name:
+    description: 'Name of the change set, for a later `mode: execute` run.'
+    value: ${{ steps.cfn.outputs.change_set_name }}
+  has-changes:
+    description: '`true` when the change set contains changes.'
+    value: ${{ steps.cfn.outputs.has_changes }}
+  replacements:
+    description: Count of resources the change set would replace.
+    value: ${{ steps.cfn.outputs.replacements }}
+  executed:
+    description: '`true` when the change set was executed in this run.'
+    value: ${{ steps.cfn.outputs.executed }}
+  outputs-json:
+    description: The stack's outputs as a compact JSON object, after a successful execute.
+    value: ${{ steps.cfn.outputs.outputs_json }}
+  comment-body-file:
+    description: Markdown file describing the change set, for the `pr-comment` action.
+    value: ${{ steps.cfn.outputs.comment_file }}
+
+runs:
+  using: composite
+  steps:
+    - name: Deploy
+      id: cfn
+      shell: bash
+      env:
+        STACK_NAME: ${{ inputs.stack-name }}
+        TEMPLATE: ${{ inputs.template }}
+        MODE: ${{ inputs.mode }}
+        PARAMETERS: ${{ inputs.parameters }}
+        PARAMETERS_FILE: ${{ inputs.parameters-file }}
+        CAPABILITIES: ${{ inputs.capabilities }}
+        TAGS: ${{ inputs.tags }}
+        IN_CHANGE_SET_NAME: ${{ inputs.change-set-name }}
+        ROLE_ARN: ${{ inputs.role-arn }}
+        DO_PACKAGE: ${{ inputs.package }}
+        S3_BUCKET: ${{ inputs.s3-bucket }}
+        S3_PREFIX: ${{ inputs.s3-prefix }}
+        TERMINATION_PROTECTION: ${{ inputs.termination-protection }}
+        FAIL_ON_EMPTY: ${{ inputs.fail-on-empty-changeset }}
+        FAIL_ON_REPLACEMENT: ${{ inputs.fail-on-replacement }}
+        WAIT_TIMEOUT: ${{ inputs.wait-timeout-minutes }}
+        MAX_CHARS: ${{ inputs.max-comment-chars }}
+        RUN_ID: ${{ github.run_id }}
+        RUN_ATTEMPT: ${{ github.run_attempt }}
+        SHA: ${{ github.sha }}
+      run: |
+        set -euo pipefail
+
+        case "$MODE" in
+          change-set|execute|deploy|delete) ;;
+          *) echo "::error::mode='$MODE' is not supported (change-set|execute|deploy|delete)."; exit 1 ;;
+        esac
+
+        change_set_name="${IN_CHANGE_SET_NAME:-gha-${RUN_ID}-${RUN_ATTEMPT}}"
+        stack_id=''; change_set_id=''; has_changes=false; replacements=0
+        executed=false; outputs_json='{}'
+        comment_file=/tmp/atk-cfn-comment.md
+        : > "$comment_file"
+
+        # ── Stack state ──────────────────────────────────────────────────────────
+        # REVIEW_IN_PROGRESS means a stack row exists but nothing was ever deployed; it
+        # can only be CREATEd into, never UPDATEd.
+        stack_status="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+          --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo 'DOES_NOT_EXIST')"
+        echo "Stack '$STACK_NAME' status: $stack_status"
+
+        # ── delete ───────────────────────────────────────────────────────────────
+        if [ "$MODE" = "delete" ]; then
+          if [ "$stack_status" = "DOES_NOT_EXIST" ]; then
+            echo "::notice::Stack '$STACK_NAME' does not exist — nothing to delete."
+          else
+            aws cloudformation delete-stack --stack-name "$STACK_NAME"
+            echo "Waiting for deletion…"
+            aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"
+            echo "::notice::Deleted stack '$STACK_NAME'."
+          fi
+          {
+            echo "stack_id="; echo "change_set_id="; echo "change_set_name="
+            echo "has_changes=false"; echo "replacements=0"; echo "executed=true"
+            echo "outputs_json={}"; echo "comment_file=$comment_file"
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # ── Build the parameter and tag lists ────────────────────────────────────
+        # Assembled as JSON and passed with `--cli-input-json`-style array arguments, so a
+        # value containing spaces or commas can't break the argument parsing the way
+        # `Key=Value` shorthand does.
+        params_json='[]'
+        if [ -n "$PARAMETERS_FILE" ]; then
+          [ -f "$PARAMETERS_FILE" ] || { echo "::error::parameters-file '$PARAMETERS_FILE' does not exist."; exit 1; }
+          params_json="$(jq -c . "$PARAMETERS_FILE")"
+        fi
+        if [ -n "$PARAMETERS" ]; then
+          inline_json="$(jq -Rn '[inputs
+            | select(length > 0 and (startswith("#") | not))
+            | { ParameterKey: (split("=")[0]), raw: (sub("^[^=]*=";"")) }
+            | if .raw == "__USE_PREVIOUS__"
+              then { ParameterKey, UsePreviousValue: true }
+              else { ParameterKey, ParameterValue: .raw }
+              end]' <<< "$PARAMETERS")"
+          # Inline parameters win over the file; group_by/last keeps the later entry.
+          params_json="$(jq -c --argjson a "$params_json" --argjson b "$inline_json" \
+            -n '($a + $b) | group_by(.ParameterKey) | map(last)')"
+        fi
+
+        tags_json='[]'
+        if [ -n "$TAGS" ]; then
+          tags_json="$(jq -Rn '[inputs
+            | select(length > 0 and (startswith("#") | not))
+            | { Key: (split("=")[0]), Value: (sub("^[^=]*=";"")) }]' <<< "$TAGS")"
+        fi
+
+        # ── Template source ──────────────────────────────────────────────────────
+        template_args=()
+        if [ "$MODE" != "execute" ]; then
+          [ -n "$TEMPLATE" ] || { echo "::error::mode='$MODE' requires a template."; exit 1; }
+
+          if [ "$DO_PACKAGE" = "true" ]; then
+            [ -n "$S3_BUCKET" ] || { echo "::error::package: true requires s3-bucket."; exit 1; }
+            pkg=(cloudformation package --template-file "$TEMPLATE"
+                 --s3-bucket "$S3_BUCKET" --output-template-file /tmp/atk-cfn-packaged.yml)
+            [ -n "$S3_PREFIX" ] && pkg+=(--s3-prefix "$S3_PREFIX")
+            aws "${pkg[@]}"
+            TEMPLATE=/tmp/atk-cfn-packaged.yml
+            echo "Packaged template written to $TEMPLATE"
+          fi
+
+          case "$TEMPLATE" in
+            http://*|https://*)
+              template_args=(--template-url "$TEMPLATE") ;;
+            *)
+              [ -f "$TEMPLATE" ] || { echo "::error::template '$TEMPLATE' does not exist."; exit 1; }
+              # The inline body limit is 51,200 bytes; past that the template must go
+              # through S3, which is what `package` is for.
+              size="$(wc -c < "$TEMPLATE")"
+              if [ "$size" -gt 51200 ]; then
+                echo "::error::Template is ${size} bytes, over CloudFormation's 51200-byte inline limit. Set package: true with an s3-bucket."
+                exit 1
+              fi
+              template_args=(--template-body "file://$TEMPLATE")
+              aws cloudformation validate-template "${template_args[@]}" > /dev/null
+              echo "Template validated."
+              ;;
+          esac
+        fi
+
+        # ── Create the change set ────────────────────────────────────────────────
+        if [ "$MODE" != "execute" ]; then
+          case "$stack_status" in
+            DOES_NOT_EXIST|REVIEW_IN_PROGRESS) cs_type=CREATE ;;
+            *) cs_type=UPDATE ;;
+          esac
+          echo "Creating $cs_type change set '$change_set_name'…"
+
+          create=(cloudformation create-change-set
+                  --stack-name "$STACK_NAME"
+                  --change-set-name "$change_set_name"
+                  --change-set-type "$cs_type"
+                  --parameters "$params_json"
+                  --tags "$tags_json")
+          create+=("${template_args[@]}")
+          [ -n "$ROLE_ARN" ] && create+=(--role-arn "$ROLE_ARN")
+          if [ -n "$CAPABILITIES" ]; then
+            IFS=',' read -ra caps <<< "$CAPABILITIES"
+            create+=(--capabilities "${caps[@]}")
+          fi
+
+          change_set_id="$(aws "${create[@]}" --query 'Id' --output text)"
+
+          # `wait change-set-create-complete` exits non-zero for a no-op change set, which
+          # is a successful outcome here — hence the manual status check below.
+          set +e
+          aws cloudformation wait change-set-create-complete \
+            --change-set-name "$change_set_id" >/dev/null 2>&1
+          set -e
+
+          describe="$(aws cloudformation describe-change-set --change-set-name "$change_set_id" --output json)"
+          cs_status="$(jq -r '.Status' <<< "$describe")"
+          cs_reason="$(jq -r '.StatusReason // ""' <<< "$describe")"
+
+          if [ "$cs_status" = "FAILED" ]; then
+            if grep -qiE "didn't contain changes|no updates are to be performed" <<< "$cs_reason"; then
+              echo "::notice::No changes — the deployed stack already matches the template."
+              has_changes=false
+              # Leaving empty change sets behind clutters the console and eventually hits
+              # the per-stack limit.
+              aws cloudformation delete-change-set --change-set-name "$change_set_id" || true
+              change_set_id=''
+
+              {
+                printf '### CloudFormation — `%s`\n\n' "$STACK_NAME"
+                printf '✅ **No changes.** The deployed stack already matches the template.\n'
+              } > "$comment_file"
+
+              if [ "$FAIL_ON_EMPTY" = "true" ]; then
+                echo "::error::Change set is empty and fail-on-empty-changeset is set."
+                exit 1
+              fi
+            else
+              echo "::error::Change set creation failed: $cs_reason"
+              exit 1
+            fi
+          else
+            has_changes=true
+          fi
+        else
+          # mode: execute — adopt the named change set that a previous run created.
+          change_set_id="$(aws cloudformation describe-change-set \
+            --stack-name "$STACK_NAME" --change-set-name "$change_set_name" \
+            --query 'ChangeSetId' --output text)"
+          describe="$(aws cloudformation describe-change-set --change-set-name "$change_set_id" --output json)"
+          has_changes=true
+        fi
+
+        # ── Render the diff ──────────────────────────────────────────────────────
+        if [ "$has_changes" = "true" ]; then
+          jq -r '
+            .Changes[]? | .ResourceChange
+            | [ (.Action // "?"),
+                (.LogicalResourceId // "?"),
+                (.ResourceType // "?"),
+                (.Replacement // "-"),
+                ((.Scope // []) | join(","))
+              ] | @tsv' <<< "$describe" > /tmp/atk-cfn-changes.tsv
+
+          adds="$(awk -F'\t' '$1=="Add"{n++} END{print n+0}' /tmp/atk-cfn-changes.tsv)"
+          mods="$(awk -F'\t' '$1=="Modify"{n++} END{print n+0}' /tmp/atk-cfn-changes.tsv)"
+          removes="$(awk -F'\t' '$1=="Remove"{n++} END{print n+0}' /tmp/atk-cfn-changes.tsv)"
+          replacements="$(awk -F'\t' '$4=="True"{n++} END{print n+0}' /tmp/atk-cfn-changes.tsv)"
+
+          echo "Change set: ${adds} to add, ${mods} to modify, ${removes} to remove, ${replacements} replacement(s)."
+
+          if [ "$replacements" -gt 0 ]; then
+            echo "::warning::This change set REPLACES ${replacements} resource(s). Replacement destroys and recreates — check for data loss."
+          fi
+
+          {
+            printf '### CloudFormation — `%s`\n\n' "$STACK_NAME"
+            if [ "$replacements" -gt 0 ]; then
+              printf '⚠️ **%s to add, %s to modify, %s to remove — %s REPLACEMENT(S)**\n\n' \
+                "$adds" "$mods" "$removes" "$replacements"
+              printf 'Replacement destroys and recreates the resource. Confirm this is safe for stateful resources.\n\n'
+            else
+              printf '📋 **%s to add, %s to modify, %s to remove**\n\n' "$adds" "$mods" "$removes"
+            fi
+            printf '| Action | Logical ID | Type | Replacement | Scope |\n|---|---|---|---|---|\n'
+            awk -F'\t' '{printf "| %s | `%s` | `%s` | %s | %s |\n", $1, $2, $3, ($4=="True" ? "**YES**" : $4), $5}' \
+              /tmp/atk-cfn-changes.tsv
+            printf '\n<sub>Change set `%s` · commit `%s`</sub>\n' "$change_set_name" "${SHA:0:7}"
+          } > /tmp/atk-cfn-full.md
+
+          if [ "$(wc -c < /tmp/atk-cfn-full.md)" -gt "$MAX_CHARS" ]; then
+            head -c "$MAX_CHARS" /tmp/atk-cfn-full.md > "$comment_file"
+            printf '\n\n> ⚠️ Truncated. The full change set is in the run log.\n' >> "$comment_file"
+          else
+            cp /tmp/atk-cfn-full.md "$comment_file"
+          fi
+
+          if [ "$FAIL_ON_REPLACEMENT" = "true" ] && [ "$replacements" -gt 0 ]; then
+            echo "::error::Change set replaces ${replacements} resource(s) and fail-on-replacement is set."
+            cat "$comment_file" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+        fi
+
+        cat "$comment_file" >> "$GITHUB_STEP_SUMMARY"
+
+        # ── Execute ──────────────────────────────────────────────────────────────
+        if { [ "$MODE" = "deploy" ] || [ "$MODE" = "execute" ]; } && [ "$has_changes" = "true" ]; then
+          echo "Executing change set…"
+          aws cloudformation execute-change-set --change-set-name "$change_set_id"
+
+          # CREATE and UPDATE have different terminal waiters.
+          case "$stack_status" in
+            DOES_NOT_EXIST|REVIEW_IN_PROGRESS) waiter=stack-create-complete ;;
+            *) waiter=stack-update-complete ;;
+          esac
+
+          set +e
+          timeout "${WAIT_TIMEOUT}m" aws cloudformation wait "$waiter" --stack-name "$STACK_NAME"
+          wait_exit=$?
+          set -e
+
+          if [ "$wait_exit" -ne 0 ]; then
+            echo "::error::Stack operation did not complete successfully. Recent failure events:"
+            # The first failed event is the actual cause; everything after is cascade.
+            aws cloudformation describe-stack-events --stack-name "$STACK_NAME" \
+              --query 'StackEvents[?contains(ResourceStatus, `FAILED`)].[Timestamp,LogicalResourceId,ResourceStatus,ResourceStatusReason]' \
+              --output table | head -40 || true
+            exit 1
+          fi
+
+          executed=true
+          echo "::notice::Stack '$STACK_NAME' updated successfully."
+
+          if [ "$TERMINATION_PROTECTION" = "true" ]; then
+            aws cloudformation update-termination-protection \
+              --stack-name "$STACK_NAME" --enable-termination-protection > /dev/null
+            echo "Termination protection enabled."
+          fi
+        fi
+
+        # ── Collect stack facts ──────────────────────────────────────────────────
+        if [ "$stack_status" != "DOES_NOT_EXIST" ] || [ "$executed" = "true" ]; then
+          final="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --output json 2>/dev/null || echo '{}')"
+          stack_id="$(jq -r '.Stacks[0].StackId // ""' <<< "$final")"
+          outputs_json="$(jq -c '[.Stacks[0].Outputs // [] | .[] | {key: .OutputKey, value: .OutputValue}] | from_entries' <<< "$final")"
+        fi
+
+        {
+          echo "stack_id=$stack_id"
+          echo "change_set_id=$change_set_id"
+          echo "change_set_name=$change_set_name"
+          echo "has_changes=$has_changes"
+          echo "replacements=$replacements"
+          echo "executed=$executed"
+          echo "outputs_json=$outputs_json"
+          echo "comment_file=$comment_file"
+        } >> "$GITHUB_OUTPUT"

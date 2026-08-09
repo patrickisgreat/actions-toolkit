@@ -1,0 +1,302 @@
+# One AWS deploy workflow, three targets, selected by `target`.
+#
+#   ecs    → register a task definition with the new image and roll the service
+#   lambda → update the function and move an alias to the new published version
+#   static → sync a build directory to S3 with correct cache headers, invalidate CloudFront
+#
+# One workflow rather than three because everything around the deploy — OIDC auth,
+# environment gating, notification, rollback reporting — is identical, and keeping it in
+# one place means a fix to the auth path fixes all three.
+#
+# Authentication is OIDC by default; `aws-role-to-assume` is all you need. See
+# docs/SECURITY.md for the trust policy.
+#
+# Usage:
+#   jobs:
+#     deploy:
+#       uses: patrickisgreat/actions-toolkit/.github/workflows/deploy-aws.yml@v1
+#       with:
+#         target: ecs
+#         aws-region: us-east-1
+#         aws-role-to-assume: arn:aws:iam::1234:role/gha-deploy
+#         cluster: prod
+#         service: api
+#         image: ${{ needs.image.outputs.image-digest-ref }}
+#         environment-name: production
+#       permissions:
+#         contents: read
+#         id-token: write
+
+name: Deploy AWS
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: 'ecs | lambda | static'
+        type: string
+        required: true
+      aws-region:
+        description: AWS region.
+        type: string
+        required: true
+      aws-role-to-assume:
+        description: OIDC role ARN. Preferred over static keys.
+        type: string
+        required: false
+        default: ''
+      environment-name:
+        description: GitHub Environment to deploy through (where approval rules live).
+        type: string
+        required: false
+        default: ''
+
+      # ── ecs ──────────────────────────────────────────────────────────────────
+      cluster:
+        description: ECS cluster.
+        type: string
+        required: false
+        default: ''
+      service:
+        description: ECS service.
+        type: string
+        required: false
+        default: ''
+      container-name:
+        description: Container to update. Empty targets the first one.
+        type: string
+        required: false
+        default: ''
+      task-definition-file:
+        description: Committed task definition to use as the base. Empty fetches the live one.
+        type: string
+        required: false
+        default: ''
+      wait-for-stability:
+        description: 'true to block until the ECS service is stable.'
+        type: boolean
+        required: false
+        default: true
+
+      # ── lambda ───────────────────────────────────────────────────────────────
+      function-name:
+        description: Lambda function name.
+        type: string
+        required: false
+        default: ''
+      alias:
+        description: Lambda alias to move to the new version.
+        type: string
+        required: false
+        default: ''
+      zip-file:
+        description: Local deployment zip, as an alternative to an image.
+        type: string
+        required: false
+        default: ''
+
+      # ── static ───────────────────────────────────────────────────────────────
+      source:
+        description: Local directory to publish.
+        type: string
+        required: false
+        default: ''
+      bucket:
+        description: Target S3 bucket.
+        type: string
+        required: false
+        default: ''
+      prefix:
+        description: Key prefix within the bucket.
+        type: string
+        required: false
+        default: ''
+      distribution-id:
+        description: CloudFront distribution to invalidate.
+        type: string
+        required: false
+        default: ''
+      artifact-name:
+        description: |
+          Build artifact to download before a static deploy. Use this when a separate
+          build job produced the output — it avoids rebuilding just to publish.
+        type: string
+        required: false
+        default: ''
+
+      # ── shared ───────────────────────────────────────────────────────────────
+      image:
+        description: 'Image to deploy for `ecs`/`lambda`. Prefer an immutable digest ref.'
+        type: string
+        required: false
+        default: ''
+      environment-variables:
+        description: Newline-separated `KEY=value` pairs applied to the deployed workload.
+        type: string
+        required: false
+        default: ''
+      notify:
+        description: 'true to send a Slack/Discord notification.'
+        type: boolean
+        required: false
+        default: true
+      runs-on:
+        description: Runner label.
+        type: string
+        required: false
+        default: 'ubuntu-latest'
+      timeout-minutes:
+        description: Job timeout.
+        type: number
+        required: false
+        default: 30
+
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        description: Static access key. Only used when no OIDC role is given.
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        description: Static secret key.
+        required: false
+      SLACK_WEBHOOK:
+        required: false
+      DISCORD_WEBHOOK:
+        required: false
+
+    outputs:
+      target:
+        description: The deploy target that ran.
+        value: ${{ inputs.target }}
+      result:
+        description: A target-specific identifier — task definition ARN, Lambda version, or bucket URI.
+        value: ${{ jobs.deploy.outputs.result }}
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.target }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    environment:
+      name: ${{ inputs.environment-name }}
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      result: ${{ steps.collect.outputs.result }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Validate the target
+        env:
+          TARGET: ${{ inputs.target }}
+          CLUSTER: ${{ inputs.cluster }}
+          SERVICE: ${{ inputs.service }}
+          FUNCTION_NAME: ${{ inputs.function-name }}
+          SOURCE: ${{ inputs.source }}
+          BUCKET: ${{ inputs.bucket }}
+          IMAGE: ${{ inputs.image }}
+          ZIP_FILE: ${{ inputs.zip-file }}
+        run: |
+          set -euo pipefail
+          # Fail here with a specific message rather than deep inside a deploy action with
+          # a confusing AWS error.
+          case "$TARGET" in
+            ecs)
+              [ -n "$CLUSTER" ] && [ -n "$SERVICE" ] && [ -n "$IMAGE" ] ||
+                { echo "::error::target=ecs requires cluster, service, and image."; exit 1; } ;;
+            lambda)
+              [ -n "$FUNCTION_NAME" ] ||
+                { echo "::error::target=lambda requires function-name."; exit 1; }
+              [ -n "$IMAGE" ] || [ -n "$ZIP_FILE" ] ||
+                { echo "::error::target=lambda requires image or zip-file."; exit 1; } ;;
+            static)
+              [ -n "$SOURCE" ] && [ -n "$BUCKET" ] ||
+                { echo "::error::target=static requires source and bucket."; exit 1; } ;;
+            *) echo "::error::target='$TARGET' is not supported (ecs|lambda|static)."; exit 1 ;;
+          esac
+
+      - name: Authenticate to AWS
+        uses: ./.toolkit/actions/aws-auth
+        with:
+          aws-region: ${{ inputs.aws-region }}
+          role-to-assume: ${{ inputs.aws-role-to-assume }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Download the build artifact
+        if: ${{ inputs.target == 'static' && inputs.artifact-name != '' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ inputs.source }}
+
+      - name: Deploy to ECS
+        id: ecs
+        if: ${{ inputs.target == 'ecs' }}
+        uses: ./.toolkit/actions/deploy-aws-ecs
+        with:
+          cluster: ${{ inputs.cluster }}
+          service: ${{ inputs.service }}
+          image: ${{ inputs.image }}
+          container-name: ${{ inputs.container-name }}
+          task-definition-file: ${{ inputs.task-definition-file }}
+          environment-variables: ${{ inputs.environment-variables }}
+          wait-for-stability: ${{ inputs.wait-for-stability }}
+
+      - name: Deploy to Lambda
+        id: lambda
+        if: ${{ inputs.target == 'lambda' }}
+        uses: ./.toolkit/actions/deploy-aws-lambda
+        with:
+          function-name: ${{ inputs.function-name }}
+          image: ${{ inputs.image }}
+          zip-file: ${{ inputs.zip-file }}
+          alias: ${{ inputs.alias }}
+          environment-variables: ${{ inputs.environment-variables }}
+
+      - name: Deploy static site
+        id: static
+        if: ${{ inputs.target == 'static' }}
+        uses: ./.toolkit/actions/deploy-aws-static
+        with:
+          source: ${{ inputs.source }}
+          bucket: ${{ inputs.bucket }}
+          prefix: ${{ inputs.prefix }}
+          distribution-id: ${{ inputs.distribution-id }}
+
+      - name: Collect the result
+        id: collect
+        env:
+          TARGET: ${{ inputs.target }}
+          ECS_RESULT: ${{ steps.ecs.outputs.task-definition-arn }}
+          LAMBDA_RESULT: ${{ steps.lambda.outputs.version }}
+          STATIC_RESULT: ${{ steps.static.outputs.bucket-url }}
+        run: |
+          set -euo pipefail
+          case "$TARGET" in
+            ecs)    result="$ECS_RESULT" ;;
+            lambda) result="$LAMBDA_RESULT" ;;
+            static) result="$STATIC_RESULT" ;;
+          esac
+          echo "result=$result" >> "$GITHUB_OUTPUT"
+
+      - name: Notify
+        if: ${{ always() && inputs.notify }}
+        uses: ./.toolkit/actions/notify
+        with:
+          status: ${{ job.status }}
+          title: AWS ${{ inputs.target }} deploy — ${{ job.status }}
+          slack-webhook: ${{ secrets.SLACK_WEBHOOK }}
+          discord-webhook: ${{ secrets.DISCORD_WEBHOOK }}
+          fields: |
+            {"Target":"${{ inputs.target }}","Region":"${{ inputs.aws-region }}","Result":"${{ steps.collect.outputs.result || 'n/a' }}"}

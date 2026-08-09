@@ -1,0 +1,238 @@
+# Go CI: gofmt gate, vet, golangci-lint, tests with race detection and coverage, and an
+# optional cross-platform build matrix.
+#
+# `-race` is on by default. It roughly doubles test runtime and is worth every second — a
+# data race that only shows up under production concurrency is the single most expensive
+# class of Go bug to debug after the fact.
+#
+# Usage:
+#   jobs:
+#     ci:
+#       uses: patrickisgreat/actions-toolkit/.github/workflows/go-ci.yml@v1
+#       with:
+#         build-targets: '["linux/amd64","darwin/arm64"]'
+
+name: Go CI
+
+on:
+  workflow_call:
+    inputs:
+      go-version:
+        description: Go version. Empty reads `go.mod`.
+        type: string
+        required: false
+        default: ''
+      working-directory:
+        description: Directory containing the module.
+        type: string
+        required: false
+        default: '.'
+      runs-on:
+        description: Runner label.
+        type: string
+        required: false
+        default: 'ubuntu-latest'
+
+      lint:
+        description: 'true to run golangci-lint.'
+        type: boolean
+        required: false
+        default: true
+      golangci-lint-version:
+        description: golangci-lint version.
+        type: string
+        required: false
+        default: 'latest'
+      vet:
+        description: 'true to run `go vet ./...`.'
+        type: boolean
+        required: false
+        default: true
+      fmt:
+        description: 'true to fail when `gofmt -l` reports unformatted files.'
+        type: boolean
+        required: false
+        default: true
+
+      test-command:
+        description: Test command. Empty skips tests.
+        type: string
+        required: false
+        default: 'go test -race -coverprofile=coverage.out -covermode=atomic ./...'
+      coverage:
+        description: 'true to upload coverage to Codecov.'
+        type: boolean
+        required: false
+        default: true
+      coverage-file:
+        description: Coverage profile path.
+        type: string
+        required: false
+        default: './coverage.out'
+
+      build-targets:
+        description: |
+          JSON array of `os/arch` pairs to cross-compile, e.g. `["linux/amd64"]`.
+          Empty skips the build matrix.
+        type: string
+        required: false
+        default: ''
+      build-command:
+        description: 'Build command; `GOOS`/`GOARCH` are already exported.'
+        type: string
+        required: false
+        default: 'go build ./...'
+      timeout-minutes:
+        description: Per-job timeout.
+        type: number
+        required: false
+        default: 20
+
+    secrets:
+      CODECOV_TOKEN:
+        description: Codecov upload token.
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint & vet
+    if: ${{ inputs.lint || inputs.vet || inputs.fmt }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Set up Go
+        uses: ./.toolkit/actions/setup-go
+        with:
+          go-version: ${{ inputs.go-version }}
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: gofmt
+        if: ${{ inputs.fmt }}
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          # gofmt exits 0 even when files are unformatted; the file list is the signal.
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::These files are not gofmt'd. Run 'gofmt -w .' and commit."
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+          echo "gofmt is clean."
+
+      - name: go vet
+        if: ${{ inputs.vet }}
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          go vet ./...
+
+      - name: golangci-lint
+        if: ${{ inputs.lint }}
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: ${{ inputs.golangci-lint-version }}
+          working-directory: ${{ inputs.working-directory }}
+
+  test:
+    name: Tests
+    if: ${{ inputs.test-command != '' }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Set up Go
+        uses: ./.toolkit/actions/setup-go
+        with:
+          go-version: ${{ inputs.go-version }}
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: Run tests
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          TEST_COMMAND: ${{ inputs.test-command }}
+        run: |
+          set -euo pipefail
+          bash -eo pipefail -c "$TEST_COMMAND"
+
+      - name: Coverage summary
+        if: ${{ always() && inputs.coverage-file != '' }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          COVERAGE_FILE: ${{ inputs.coverage-file }}
+        run: |
+          set -euo pipefail
+          [ -f "$COVERAGE_FILE" ] || exit 0
+          total="$(go tool cover -func="$COVERAGE_FILE" | tail -n1 | awk '{print $NF}')"
+          echo "### Go coverage: ${total}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage to Codecov
+        if: ${{ inputs.coverage && always() }}
+        uses: codecov/codecov-action@v7
+        with:
+          files: ${{ inputs.coverage-file }}
+          flags: go
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  build:
+    name: Build ${{ matrix.target }}
+    if: ${{ inputs.build-targets != '' }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(inputs.build-targets) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Set up Go
+        uses: ./.toolkit/actions/setup-go
+        with:
+          go-version: ${{ inputs.go-version }}
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: Cross-compile
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          TARGET: ${{ matrix.target }}
+          BUILD_COMMAND: ${{ inputs.build-command }}
+        run: |
+          set -euo pipefail
+          GOOS="${TARGET%%/*}"
+          GOARCH="${TARGET##*/}"
+          export GOOS GOARCH
+          # CGO can't cross-compile without a matching toolchain; a pure-Go build is the
+          # only thing that works uniformly across a target matrix.
+          export CGO_ENABLED=0
+          echo "Building for GOOS=$GOOS GOARCH=$GOARCH"
+          bash -eo pipefail -c "$BUILD_COMMAND"

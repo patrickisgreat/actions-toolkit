@@ -1,0 +1,147 @@
+# Upsert a single sticky comment on a PR or issue, keyed by a hidden marker.
+#
+# Every pipeline in this toolkit that wants to report back — terraform plan, LLM eval
+# results, cost reports, deploy previews — writes through here, so a PR ends up with one
+# stable comment per concern that gets edited in place instead of a wall of duplicates on
+# every push.
+#
+# The marker is an HTML comment (`<!-- actions-toolkit:terraform-plan -->`) invisible in the
+# rendered comment. Body text is passed through the API, never through a shell command
+# line, so untrusted content can't inject.
+#
+# Requires `permissions: pull-requests: write` (or `issues: write` for issues).
+
+name: PR comment
+description: Create or update a sticky PR/issue comment identified by a marker
+
+inputs:
+  marker:
+    description: Stable identifier for this comment. One marker per concern, per PR.
+    required: true
+  body:
+    description: Markdown body. The marker is prepended automatically.
+    required: false
+    default: ''
+  body-file:
+    description: Read the body from this file instead of `body`. Takes precedence.
+    required: false
+    default: ''
+  issue-number:
+    description: PR/issue number. Empty resolves from the event payload.
+    required: false
+    default: ''
+  mode:
+    description: 'upsert | append | recreate | delete. `recreate` deletes then posts (bumps notifications).'
+    required: false
+    default: 'upsert'
+  max-length:
+    description: Truncate the body to this many characters (GitHub's hard limit is 65536).
+    required: false
+    default: '60000'
+  github-token:
+    description: Token with write access to pull requests/issues.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  comment-id:
+    description: The id of the comment created or updated. Empty when deleted or skipped.
+    value: ${{ steps.upsert.outputs.result }}
+
+runs:
+  using: composite
+  steps:
+    - name: Read the body
+      id: read
+      shell: bash
+      env:
+        BODY: ${{ inputs.body }}
+        BODY_FILE: ${{ inputs.body-file }}
+        MAX_LENGTH: ${{ inputs.max-length }}
+      run: |
+        set -euo pipefail
+
+        if [ -n "$BODY_FILE" ]; then
+          if [ ! -f "$BODY_FILE" ]; then
+            echo "::error::body-file '$BODY_FILE' does not exist."
+            exit 1
+          fi
+          content="$(cat "$BODY_FILE")"
+        else
+          content="$BODY"
+        fi
+
+        # Truncate rather than let the API reject an oversized comment.
+        if [ "${#content}" -gt "$MAX_LENGTH" ]; then
+          content="${content:0:$MAX_LENGTH}"$'\n\n_…truncated by actions-toolkit/pr-comment._'
+          echo "::warning::Comment body exceeded $MAX_LENGTH characters and was truncated."
+        fi
+
+        # Multi-line values go through a heredoc-delimited output.
+        {
+          echo 'content<<__ATK_EOF__'
+          echo "$content"
+          echo '__ATK_EOF__'
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Upsert the comment
+      id: upsert
+      uses: actions/github-script@v9
+      env:
+        MARKER: ${{ inputs.marker }}
+        CONTENT: ${{ steps.read.outputs.content }}
+        MODE: ${{ inputs.mode }}
+        ISSUE_NUMBER: ${{ inputs.issue-number }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        result-encoding: string
+        script: |
+          const marker = `<!-- actions-toolkit:${process.env.MARKER} -->`;
+          const mode = process.env.MODE;
+
+          const issueNumber = Number(
+            process.env.ISSUE_NUMBER ||
+            context.payload.pull_request?.number ||
+            context.payload.issue?.number ||
+            0,
+          );
+          if (!issueNumber) {
+            core.warning('No PR/issue number available — skipping comment.');
+            return '';
+          }
+
+          const { owner, repo } = context.repo;
+          const existing = await github.paginate(github.rest.issues.listComments, {
+            owner, repo, issue_number: issueNumber, per_page: 100,
+          }).then((comments) => comments.find((c) => c.body?.includes(marker)));
+
+          if (mode === 'delete') {
+            if (existing) {
+              await github.rest.issues.deleteComment({ owner, repo, comment_id: existing.id });
+              core.info(`Deleted comment ${existing.id}.`);
+            }
+            return '';
+          }
+
+          if (existing && mode === 'recreate') {
+            await github.rest.issues.deleteComment({ owner, repo, comment_id: existing.id });
+          }
+
+          // `append` keeps the prior body and adds to it; the marker stays at the top.
+          const body = existing && mode === 'append'
+            ? `${existing.body}\n\n---\n\n${process.env.CONTENT}`
+            : `${marker}\n${process.env.CONTENT}`;
+
+          if (existing && mode !== 'recreate') {
+            const { data } = await github.rest.issues.updateComment({
+              owner, repo, comment_id: existing.id, body,
+            });
+            core.info(`Updated comment ${data.id}.`);
+            return String(data.id);
+          }
+
+          const { data } = await github.rest.issues.createComment({
+            owner, repo, issue_number: issueNumber, body,
+          });
+          core.info(`Created comment ${data.id}.`);
+          return String(data.id);

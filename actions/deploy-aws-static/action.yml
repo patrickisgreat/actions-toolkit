@@ -1,0 +1,177 @@
+# Publish a static site to S3 and invalidate CloudFront.
+#
+# The part people get wrong is cache headers, so this action makes the correct behaviour the
+# default. Static site generators emit two kinds of file:
+#
+#   • Fingerprinted assets (`app.4f3a2b.js`) — safe to cache forever, and you *want* them
+#     cached forever, because the filename changes when the content does.
+#   • Entry points (`index.html`, `sw.js`, manifests) — must never be cached at the edge or
+#     visitors keep loading an old app shell that references deleted asset filenames.
+#
+# So the upload happens in two passes: long-lived immutable assets first, then no-cache
+# entry points, then the delete pass. Uploading in that order means a visitor mid-deploy can
+# never fetch a new HTML file that points at assets which haven't landed yet.
+#
+# Authenticate with `aws-auth` first.
+
+name: Deploy static site to AWS
+description: Sync a build directory to S3 with correct cache headers and invalidate CloudFront
+
+inputs:
+  source:
+    description: Local directory to publish.
+    required: true
+  bucket:
+    description: Target S3 bucket name.
+    required: true
+  prefix:
+    description: 'Key prefix within the bucket, e.g. `previews/pr-42`. Empty means the root.'
+    required: false
+    default: ''
+  distribution-id:
+    description: CloudFront distribution to invalidate. Empty skips invalidation.
+    required: false
+    default: ''
+  invalidation-paths:
+    description: Space-separated paths to invalidate.
+    required: false
+    default: '/*'
+  immutable-globs:
+    description: |
+      Space-separated globs treated as fingerprinted and cached for a year.
+      Matched against the key path.
+    required: false
+    default: '*.js *.css *.woff2 *.woff *.png *.jpg *.jpeg *.gif *.svg *.webp *.avif *.ico *.mp4'
+  no-cache-globs:
+    description: Space-separated globs served with `no-cache`, always revalidated.
+    required: false
+    default: '*.html *.json *.xml *.txt sw.js'
+  immutable-cache-control:
+    description: Cache-Control header for immutable assets.
+    required: false
+    default: 'public, max-age=31536000, immutable'
+  no-cache-cache-control:
+    description: Cache-Control header for entry points.
+    required: false
+    default: 'public, max-age=0, must-revalidate'
+  delete:
+    description: 'true to remove objects in the bucket that no longer exist in `source`.'
+    required: false
+    default: 'true'
+  dry-run:
+    description: 'true to show what would change without writing anything.'
+    required: false
+    default: 'false'
+  extra-args:
+    description: Extra args appended to every `aws s3 sync` call.
+    required: false
+    default: ''
+
+outputs:
+  bucket-url:
+    description: 's3:// URI that was published to.'
+    value: ${{ steps.sync.outputs.bucket_url }}
+  invalidation-id:
+    description: The CloudFront invalidation ID, when one was created.
+    value: ${{ steps.invalidate.outputs.invalidation_id }}
+
+runs:
+  using: composite
+  steps:
+    - name: Sync to S3
+      id: sync
+      shell: bash
+      env:
+        SOURCE: ${{ inputs.source }}
+        BUCKET: ${{ inputs.bucket }}
+        PREFIX: ${{ inputs.prefix }}
+        IMMUTABLE_GLOBS: ${{ inputs.immutable-globs }}
+        NO_CACHE_GLOBS: ${{ inputs.no-cache-globs }}
+        IMMUTABLE_CC: ${{ inputs.immutable-cache-control }}
+        NO_CACHE_CC: ${{ inputs.no-cache-cache-control }}
+        DO_DELETE: ${{ inputs.delete }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        EXTRA_ARGS: ${{ inputs.extra-args }}
+      run: |
+        set -euo pipefail
+
+        [ -d "$SOURCE" ] || { echo "::error::source directory '$SOURCE' does not exist."; exit 1; }
+
+        dest="s3://${BUCKET}"
+        [ -n "$PREFIX" ] && dest="${dest}/${PREFIX#/}"
+        echo "Publishing $SOURCE → $dest"
+
+        common=(--no-progress)
+        [ "$DRY_RUN" = "true" ] && common+=(--dryrun)
+        # shellcheck disable=SC2206
+        common+=($EXTRA_ARGS)
+
+        # Pass 1 — fingerprinted assets, cached for a year. Exclude everything, then
+        # re-include only the immutable globs, so a file matches at most one pass.
+        pass1=(--exclude '*')
+        for glob in $IMMUTABLE_GLOBS; do pass1+=(--include "$glob"); done
+        for glob in $NO_CACHE_GLOBS; do pass1+=(--exclude "$glob"); done
+
+        echo "::group::Pass 1 — immutable assets"
+        aws s3 sync "$SOURCE" "$dest" "${common[@]}" "${pass1[@]}" \
+          --cache-control "$IMMUTABLE_CC"
+        echo "::endgroup::"
+
+        # Pass 2 — entry points, never cached at the edge. Runs second so the HTML that
+        # references the new assets is only published once those assets exist.
+        pass2=(--exclude '*')
+        for glob in $NO_CACHE_GLOBS; do pass2+=(--include "$glob"); done
+
+        echo "::group::Pass 2 — entry points (no-cache)"
+        aws s3 sync "$SOURCE" "$dest" "${common[@]}" "${pass2[@]}" \
+          --cache-control "$NO_CACHE_CC"
+        echo "::endgroup::"
+
+        # Pass 3 — anything not matched by either glob set, plus deletions. `--delete` is
+        # deliberately confined to this pass: running it in pass 1 would delete every HTML
+        # file before pass 2 re-uploaded it.
+        pass3=()
+        [ "$DO_DELETE" = "true" ] && pass3+=(--delete)
+
+        echo "::group::Pass 3 — remaining files${DO_DELETE:+ and deletions}"
+        aws s3 sync "$SOURCE" "$dest" "${common[@]}" "${pass3[@]+"${pass3[@]}"}"
+        echo "::endgroup::"
+
+        echo "bucket_url=$dest" >> "$GITHUB_OUTPUT"
+
+    - name: Invalidate CloudFront
+      id: invalidate
+      if: inputs.distribution-id != '' && inputs.dry-run != 'true'
+      shell: bash
+      env:
+        DISTRIBUTION_ID: ${{ inputs.distribution-id }}
+        PATHS: ${{ inputs.invalidation-paths }}
+      run: |
+        set -euo pipefail
+        # shellcheck disable=SC2086
+        invalidation_id="$(aws cloudfront create-invalidation \
+          --distribution-id "$DISTRIBUTION_ID" \
+          --paths $PATHS \
+          --query 'Invalidation.Id' --output text)"
+        echo "invalidation_id=$invalidation_id" >> "$GITHUB_OUTPUT"
+        echo "Created CloudFront invalidation $invalidation_id for: $PATHS"
+
+    - name: Summarize
+      shell: bash
+      env:
+        DEST: ${{ steps.sync.outputs.bucket_url }}
+        DISTRIBUTION_ID: ${{ inputs.distribution-id }}
+        INVALIDATION_ID: ${{ steps.invalidate.outputs.invalidation_id }}
+        DRY_RUN: ${{ inputs.dry-run }}
+      run: |
+        set -euo pipefail
+        {
+          echo "### 🪣 Static deploy"
+          echo
+          echo "| | |"
+          echo "|---|---|"
+          echo "| Destination | \`${DEST}\` |"
+          echo "| Dry run | \`${DRY_RUN}\` |"
+          [ -n "$DISTRIBUTION_ID" ] && echo "| Distribution | \`${DISTRIBUTION_ID}\` |"
+          [ -n "$INVALIDATION_ID" ] && echo "| Invalidation | \`${INVALIDATION_ID}\` |"
+        } >> "$GITHUB_STEP_SUMMARY"

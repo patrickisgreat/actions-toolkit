@@ -1,0 +1,192 @@
+# Update a Lambda function's code and, optionally, publish an immutable version behind an
+# alias.
+#
+# Three source shapes, because real repos use all three:
+#   • `image`     — a container image URI (the usual pairing with docker-build-push)
+#   • `zip-file`  — a local zip uploaded directly (fine under ~50 MB)
+#   • `s3-bucket` + `s3-key` — a zip already in S3 (required above the direct-upload limit)
+#
+# Publishing a version and moving an alias is the deploy pattern worth defaulting to:
+# `$LATEST` is mutable and gives you nothing to roll back to, whereas `alias → version N`
+# makes rollback a single alias update. Set `alias` to turn it on.
+#
+# Authenticate with `aws-auth` first.
+
+name: Deploy AWS Lambda
+description: Update Lambda function code from an image, zip, or S3 object and move an alias
+
+inputs:
+  function-name:
+    description: Lambda function name or ARN.
+    required: true
+  image:
+    description: Container image URI. Mutually exclusive with the zip inputs.
+    required: false
+    default: ''
+  zip-file:
+    description: Path to a local deployment zip.
+    required: false
+    default: ''
+  s3-bucket:
+    description: Bucket holding the deployment zip.
+    required: false
+    default: ''
+  s3-key:
+    description: Key of the deployment zip.
+    required: false
+    default: ''
+  publish:
+    description: 'true to publish an immutable version after updating the code.'
+    required: false
+    default: 'true'
+  alias:
+    description: Alias to point at the newly published version. Empty skips alias handling.
+    required: false
+    default: ''
+  environment-variables:
+    description: |
+      Newline-separated `KEY=value` pairs merged into the function's environment.
+      Existing variables not listed are preserved.
+    required: false
+    default: ''
+  memory-size:
+    description: Override memory in MB. Empty leaves it unchanged.
+    required: false
+    default: ''
+  timeout:
+    description: Override timeout in seconds. Empty leaves it unchanged.
+    required: false
+    default: ''
+  wait:
+    description: 'true to wait for the update to finish before returning.'
+    required: false
+    default: 'true'
+
+outputs:
+  version:
+    description: The published version number, or `$LATEST` when `publish` is false.
+    value: ${{ steps.deploy.outputs.version }}
+  function-arn:
+    description: ARN of the deployed function (qualified with the version when published).
+    value: ${{ steps.deploy.outputs.function_arn }}
+  alias-arn:
+    description: ARN of the alias, when one was set.
+    value: ${{ steps.deploy.outputs.alias_arn }}
+
+runs:
+  using: composite
+  steps:
+    - name: Update and publish
+      id: deploy
+      shell: bash
+      env:
+        FUNCTION_NAME: ${{ inputs.function-name }}
+        IMAGE: ${{ inputs.image }}
+        ZIP_FILE: ${{ inputs.zip-file }}
+        S3_BUCKET: ${{ inputs.s3-bucket }}
+        S3_KEY: ${{ inputs.s3-key }}
+        PUBLISH: ${{ inputs.publish }}
+        ALIAS: ${{ inputs.alias }}
+        ENV_VARS: ${{ inputs.environment-variables }}
+        MEMORY_SIZE: ${{ inputs.memory-size }}
+        TIMEOUT: ${{ inputs.timeout }}
+        DO_WAIT: ${{ inputs.wait }}
+      run: |
+        set -euo pipefail
+
+        # ── Validate exactly one code source ─────────────────────────────────────
+        sources=0
+        [ -n "$IMAGE" ] && sources=$((sources + 1))
+        [ -n "$ZIP_FILE" ] && sources=$((sources + 1))
+        [ -n "$S3_BUCKET" ] && sources=$((sources + 1))
+        if [ "$sources" -ne 1 ]; then
+          echo "::error::Provide exactly one code source: image, zip-file, or s3-bucket + s3-key (got $sources)."
+          exit 1
+        fi
+        if [ -n "$S3_BUCKET" ] && [ -z "$S3_KEY" ]; then
+          echo "::error::s3-bucket requires s3-key."
+          exit 1
+        fi
+
+        # ── Update the code ──────────────────────────────────────────────────────
+        update=(lambda update-function-code --function-name "$FUNCTION_NAME")
+        if [ -n "$IMAGE" ]; then
+          update+=(--image-uri "$IMAGE")
+        elif [ -n "$ZIP_FILE" ]; then
+          [ -f "$ZIP_FILE" ] || { echo "::error::zip-file '$ZIP_FILE' does not exist."; exit 1; }
+          update+=(--zip-file "fileb://$ZIP_FILE")
+        else
+          update+=(--s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY")
+        fi
+        [ "$PUBLISH" = "true" ] && update+=(--publish)
+
+        result="$(aws "${update[@]}" --output json)"
+
+        if [ "$DO_WAIT" = "true" ]; then
+          aws lambda wait function-updated-v2 --function-name "$FUNCTION_NAME"
+        fi
+
+        # ── Optional configuration changes ───────────────────────────────────────
+        # update-function-configuration conflicts with an in-flight code update, so it runs
+        # after the wait above and gets its own wait.
+        config=(lambda update-function-configuration --function-name "$FUNCTION_NAME")
+        config_changed=false
+
+        if [ -n "$ENV_VARS" ]; then
+          existing="$(aws lambda get-function-configuration --function-name "$FUNCTION_NAME" \
+            --query 'Environment.Variables' --output json)"
+          [ "$existing" = "null" ] && existing='{}'
+          merged="$(jq -Rn --argjson existing "$existing" '
+            [inputs | select(length > 0 and (startswith("#") | not)) |
+             { key: (. | split("=")[0]), value: (. | sub("^[^=]*=";"")) }]
+            | from_entries as $new
+            | { Variables: ($existing + $new) }' <<< "$ENV_VARS")"
+          config+=(--environment "$merged")
+          config_changed=true
+        fi
+        [ -n "$MEMORY_SIZE" ] && { config+=(--memory-size "$MEMORY_SIZE"); config_changed=true; }
+        [ -n "$TIMEOUT" ] && { config+=(--timeout "$TIMEOUT"); config_changed=true; }
+
+        if [ "$config_changed" = "true" ]; then
+          aws "${config[@]}" > /dev/null
+          aws lambda wait function-updated-v2 --function-name "$FUNCTION_NAME"
+          echo "Updated function configuration."
+        fi
+
+        version="$(jq -r '.Version // "$LATEST"' <<< "$result")"
+        function_arn="$(jq -r '.FunctionArn' <<< "$result")"
+        echo "Deployed $FUNCTION_NAME version $version"
+
+        # ── Move the alias ───────────────────────────────────────────────────────
+        alias_arn=''
+        if [ -n "$ALIAS" ]; then
+          if [ "$PUBLISH" != "true" ]; then
+            echo "::error::alias requires publish: true — an alias cannot point at \$LATEST."
+            exit 1
+          fi
+          if aws lambda get-alias --function-name "$FUNCTION_NAME" --name "$ALIAS" >/dev/null 2>&1; then
+            alias_arn="$(aws lambda update-alias --function-name "$FUNCTION_NAME" \
+              --name "$ALIAS" --function-version "$version" --query 'AliasArn' --output text)"
+            echo "Moved alias '$ALIAS' to version $version"
+          else
+            alias_arn="$(aws lambda create-alias --function-name "$FUNCTION_NAME" \
+              --name "$ALIAS" --function-version "$version" --query 'AliasArn' --output text)"
+            echo "Created alias '$ALIAS' at version $version"
+          fi
+        fi
+
+        {
+          echo "version=$version"
+          echo "function_arn=$function_arn"
+          echo "alias_arn=$alias_arn"
+        } >> "$GITHUB_OUTPUT"
+
+        {
+          echo "### λ Lambda deploy"
+          echo
+          echo "| | |"
+          echo "|---|---|"
+          echo "| Function | \`${FUNCTION_NAME}\` |"
+          echo "| Version | \`${version}\` |"
+          [ -n "$ALIAS" ] && echo "| Alias | \`${ALIAS}\` → \`${version}\` |"
+        } >> "$GITHUB_STEP_SUMMARY"

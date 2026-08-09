@@ -1,0 +1,132 @@
+# Turn `KEY=SECRET_NAME` mappings into masked environment variables for later steps.
+#
+# The problem it solves: a reusable workflow can't know what a caller named its secrets.
+# threaditate needs `NEXT_PUBLIC_SUPABASE_URL`; another repo needs something else entirely.
+# Hardcoding names into a shared pipeline makes it not-shared.
+#
+# So the caller passes a mapping — `NEXT_PUBLIC_SUPABASE_URL=SUPABASE_URL` — plus
+# `toJSON(secrets)`, and this action resolves each mapping against the secrets it was
+# handed and exports the result to `$GITHUB_ENV`.
+#
+# Every resolved value is registered with `::add-mask::` before it is written, so it is
+# redacted in all subsequent log output. Values from `literal-vars` get the same treatment.
+#
+# NOTE: `toJSON(secrets)` inside a reusable workflow only contains the secrets that
+# workflow declared, unless the caller used `secrets: inherit`. If a mapping resolves to
+# nothing, this action warns rather than failing — a missing optional analytics key
+# shouldn't take down the build — so check the log if a variable seems absent.
+
+name: Resolve environment
+description: Resolve KEY=SECRET_NAME mappings into masked environment variables
+
+inputs:
+  mappings:
+    description: Newline-separated `KEY=SECRET_NAME` pairs resolved against `secrets-json`.
+    required: false
+    default: ''
+  literal-vars:
+    description: Newline-separated `KEY=value` pairs exported as-is (and masked).
+    required: false
+    default: ''
+  secrets-json:
+    description: '`${{ toJSON(secrets) }}` from the calling workflow.'
+    required: false
+    default: '{}'
+  mask-literals:
+    description: 'false to skip masking `literal-vars` (for genuinely public config).'
+    required: false
+    default: 'true'
+  required:
+    description: |
+      Comma-separated KEY names that must resolve to a non-empty value. Missing ones fail
+      the step instead of warning.
+    required: false
+    default: ''
+
+outputs:
+  resolved:
+    description: Comma-separated list of the variable names that were set.
+    value: ${{ steps.resolve.outputs.resolved }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve
+      id: resolve
+      shell: bash
+      env:
+        MAPPINGS: ${{ inputs.mappings }}
+        LITERAL_VARS: ${{ inputs.literal-vars }}
+        SECRETS_JSON: ${{ inputs.secrets-json }}
+        MASK_LITERALS: ${{ inputs.mask-literals }}
+        REQUIRED: ${{ inputs.required }}
+      run: |
+        set -euo pipefail
+
+        if ! jq -e 'type == "object"' >/dev/null 2>&1 <<< "$SECRETS_JSON"; then
+          # Deliberately does not spell out the expression: GitHub has no escape for the
+          # interpolation opener, so writing it here would make Actions try to evaluate it.
+          echo "::error::secrets-json is not a JSON object. Pass the toJSON(secrets) expression from the calling workflow."
+          exit 1
+        fi
+
+        resolved=()
+        missing=()
+
+        emit() {
+          local key="$1" value="$2" mask="$3"
+          [ "$mask" = "true" ] && echo "::add-mask::$value"
+          printf '%s=%s\n' "$key" "$value" >> "$GITHUB_ENV"
+          resolved+=("$key")
+          echo "Set $key"
+        }
+
+        if [ -n "$MAPPINGS" ]; then
+          while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            case "$line" in \#*) continue ;; esac
+            key="${line%%=*}"
+            secret_name="${line#*=}"
+            # A bare `KEY` with no `=` means "same name on both sides".
+            [ "$secret_name" = "$line" ] && secret_name="$key"
+            value="$(jq -r --arg n "$secret_name" '.[$n] // ""' <<< "$SECRETS_JSON")"
+            if [ -z "$value" ]; then
+              echo "::warning::'$key' maps to secret '$secret_name', which is unset or empty."
+              missing+=("$key")
+              continue
+            fi
+            emit "$key" "$value" true
+          done <<< "$MAPPINGS"
+        fi
+
+        if [ -n "$LITERAL_VARS" ]; then
+          while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            case "$line" in \#*) continue ;; esac
+            key="${line%%=*}"
+            value="${line#*=}"
+            emit "$key" "$value" "$MASK_LITERALS"
+          done <<< "$LITERAL_VARS"
+        fi
+
+        # Anything named in `required` must have landed.
+        if [ -n "$REQUIRED" ]; then
+          IFS=',' read -ra required_keys <<< "$REQUIRED"
+          failed=0
+          for key in "${required_keys[@]}"; do
+            key="$(printf '%s' "$key" | tr -d '[:space:]')"
+            [ -n "$key" ] || continue
+            found=0
+            for r in ${resolved[@]+"${resolved[@]}"}; do
+              [ "$r" = "$key" ] && { found=1; break; }
+            done
+            if [ "$found" -eq 0 ]; then
+              echo "::error::Required variable '$key' did not resolve. Check the secret exists and the caller used 'secrets: inherit'."
+              failed=1
+            fi
+          done
+          [ "$failed" -eq 0 ] || exit 1
+        fi
+
+        printf 'resolved=%s\n' "$(IFS=,; echo "${resolved[*]-}")" >> "$GITHUB_OUTPUT"
+        echo "Resolved ${#resolved[@]} variable(s); ${#missing[@]} mapping(s) had no value."

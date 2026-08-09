@@ -1,0 +1,159 @@
+# Deploy to Vercel through the official CLI.
+#
+# The CLI rather than a third-party wrapper action, because the wrappers lag behind Vercel's
+# release cadence and hide the `pull → build → deploy --prebuilt` flow that makes builds
+# reproducible. Building in the runner (not on Vercel's builders) means the deployment ships
+# exactly the artifact CI just tested, and build failures surface as job failures with real
+# logs.
+#
+# Preview vs production is one input. Preview deployments are the default so that wiring
+# this into a PR workflow is safe by accident rather than dangerous by accident.
+
+name: Deploy to Vercel
+description: Build and deploy a project to Vercel (preview or production) via the Vercel CLI
+
+inputs:
+  vercel-token:
+    description: Vercel access token (Account Settings → Tokens).
+    required: true
+  vercel-org-id:
+    description: Vercel organization/team ID (`VERCEL_ORG_ID`).
+    required: true
+  vercel-project-id:
+    description: Vercel project ID (`VERCEL_PROJECT_ID`).
+    required: true
+  environment:
+    description: 'preview | production'
+    required: false
+    default: 'preview'
+  working-directory:
+    description: Directory containing the Vercel project.
+    required: false
+    default: '.'
+  prebuilt:
+    description: |
+      `true` builds in the runner and uploads the output (reproducible, recommended).
+      `false` uploads sources and lets Vercel build.
+    required: false
+    default: 'true'
+  build-env:
+    description: Newline-separated `KEY=value` pairs exported before `vercel build`.
+    required: false
+    default: ''
+  alias:
+    description: Comma-separated domains to alias the deployment to after a successful deploy.
+    required: false
+    default: ''
+  vercel-version:
+    description: Version of the Vercel CLI to install.
+    required: false
+    default: 'latest'
+  deploy-args:
+    description: Extra args appended to `vercel deploy`.
+    required: false
+    default: ''
+
+outputs:
+  url:
+    description: The deployment URL.
+    value: ${{ steps.deploy.outputs.url }}
+  inspect-url:
+    description: Vercel dashboard URL for the deployment.
+    value: ${{ steps.deploy.outputs.inspect_url }}
+  environment:
+    description: The environment that was deployed to.
+    value: ${{ inputs.environment }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install the Vercel CLI
+      shell: bash
+      env:
+        CLI_VERSION: ${{ inputs.vercel-version }}
+      run: |
+        set -euo pipefail
+        npm install --global "vercel@${CLI_VERSION}"
+        vercel --version
+
+    - name: Deploy
+      id: deploy
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        VERCEL_TOKEN: ${{ inputs.vercel-token }}
+        VERCEL_ORG_ID: ${{ inputs.vercel-org-id }}
+        VERCEL_PROJECT_ID: ${{ inputs.vercel-project-id }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        PREBUILT: ${{ inputs.prebuilt }}
+        BUILD_ENV: ${{ inputs.build-env }}
+        DEPLOY_ARGS: ${{ inputs.deploy-args }}
+      run: |
+        set -euo pipefail
+
+        case "$ENVIRONMENT" in
+          production) prod_flag='--prod'; pull_env='production' ;;
+          preview)    prod_flag='';       pull_env='preview' ;;
+          *) echo "::error::environment='$ENVIRONMENT' is not supported (preview|production)."; exit 1 ;;
+        esac
+
+        # Export build-time env vars for `vercel build`. Values are read from the input
+        # verbatim; never echo them.
+        if [ -n "$BUILD_ENV" ]; then
+          while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            case "$line" in \#*) continue ;; esac
+            key="${line%%=*}"
+            export "$line"
+            echo "Exported build env: $key"
+          done <<< "$BUILD_ENV"
+        fi
+
+        # Pulls project settings and environment variables into .vercel/ so the local
+        # build matches what Vercel would have produced.
+        vercel pull --yes --environment="$pull_env" --token="$VERCEL_TOKEN"
+
+        # shellcheck disable=SC2086
+        if [ "$PREBUILT" = "true" ]; then
+          vercel build $prod_flag --token="$VERCEL_TOKEN"
+          deploy_out="$(vercel deploy --prebuilt $prod_flag --token="$VERCEL_TOKEN" $DEPLOY_ARGS)"
+        else
+          deploy_out="$(vercel deploy $prod_flag --token="$VERCEL_TOKEN" $DEPLOY_ARGS)"
+        fi
+
+        # The CLI prints the deployment URL as the last line of stdout.
+        url="$(printf '%s\n' "$deploy_out" | tail -n1 | tr -d '[:space:]')"
+        if [ -z "$url" ]; then
+          echo "::error::Vercel did not return a deployment URL."
+          printf '%s\n' "$deploy_out"
+          exit 1
+        fi
+
+        inspect_url="$(vercel inspect "$url" --token="$VERCEL_TOKEN" 2>&1 \
+          | grep -oE 'https://vercel\.com/[^ ]+' | head -n1 || true)"
+
+        {
+          echo "url=$url"
+          echo "inspect_url=$inspect_url"
+        } >> "$GITHUB_OUTPUT"
+        echo "Deployed to $url"
+
+    - name: Assign aliases
+      if: inputs.alias != ''
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        VERCEL_TOKEN: ${{ inputs.vercel-token }}
+        VERCEL_ORG_ID: ${{ inputs.vercel-org-id }}
+        VERCEL_PROJECT_ID: ${{ inputs.vercel-project-id }}
+        DEPLOY_URL: ${{ steps.deploy.outputs.url }}
+        ALIASES: ${{ inputs.alias }}
+      run: |
+        set -euo pipefail
+        IFS=',' read -ra domains <<< "$ALIASES"
+        for domain in "${domains[@]}"; do
+          domain="$(printf '%s' "$domain" | tr -d '[:space:]')"
+          [ -n "$domain" ] || continue
+          vercel alias set "$DEPLOY_URL" "$domain" --token="$VERCEL_TOKEN"
+          echo "Aliased $domain"
+        done

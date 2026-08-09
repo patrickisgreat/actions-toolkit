@@ -1,0 +1,308 @@
+# Terraform/OpenTofu CI: fmt, validate every root and example, tflint, trivy, and a
+# terraform-docs drift check. This is tf-tools' pipeline, generalised.
+#
+# The validate job is the interesting one. `terraform validate` needs an initialised
+# directory, so it can't run once at the repo root — it has to run per module, per example,
+# and per environment. This workflow discovers those directories, honours a `.validate-skip`
+# marker for modules that wrap live third-party APIs and can't be validated offline, and
+# fans them out across a matrix so a 30-module monorepo doesn't validate serially.
+#
+# Usage:
+#   jobs:
+#     ci:
+#       uses: patrickisgreat/actions-toolkit/.github/workflows/terraform-ci.yml@v1
+#       with:
+#         directories: 'modules environments'
+
+name: Terraform CI
+
+on:
+  workflow_call:
+    inputs:
+      binary:
+        description: 'terraform | tofu'
+        type: string
+        required: false
+        default: 'terraform'
+      version:
+        description: 'Version, or `auto` to read `.terraform-version` / `.opentofu-version`.'
+        type: string
+        required: false
+        default: 'auto'
+      directories:
+        description: Space-separated roots searched for `.tf` files.
+        type: string
+        required: false
+        default: 'modules environments'
+      skip-marker:
+        description: A directory containing this file is excluded from validate.
+        type: string
+        required: false
+        default: '.validate-skip'
+      runs-on:
+        description: Runner label.
+        type: string
+        required: false
+        default: 'ubuntu-latest'
+
+      fmt:
+        description: 'true to run `fmt -check -recursive`.'
+        type: boolean
+        required: false
+        default: true
+      validate:
+        description: 'true to init (no backend) and validate every discovered directory.'
+        type: boolean
+        required: false
+        default: true
+      tflint:
+        description: 'true to run tflint.'
+        type: boolean
+        required: false
+        default: true
+      tflint-version:
+        description: tflint version.
+        type: string
+        required: false
+        default: 'latest'
+      trivy:
+        description: 'true to run a trivy config scan.'
+        type: boolean
+        required: false
+        default: true
+      trivy-severity:
+        description: Severities reported by trivy.
+        type: string
+        required: false
+        default: 'CRITICAL,HIGH,MEDIUM'
+      trivy-fail:
+        description: |
+          `true` fails the build on findings. Default `false` matches tf-tools — report
+          while the repo matures, then tighten.
+        type: boolean
+        required: false
+        default: false
+      docs-check:
+        description: 'true to regenerate terraform-docs tables and fail if they drift.'
+        type: boolean
+        required: false
+        default: false
+      docs-directories:
+        description: Root searched for modules needing docs (each dir with a `versions.tf`).
+        type: string
+        required: false
+        default: 'modules'
+      timeout-minutes:
+        description: Per-job timeout.
+        type: number
+        required: false
+        default: 15
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    name: Discover directories
+    if: ${{ inputs.validate }}
+    runs-on: ${{ inputs.runs-on }}
+    outputs:
+      directories: ${{ steps.find.outputs.directories }}
+      count: ${{ steps.find.outputs.count }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Find Terraform directories
+        id: find
+        env:
+          ROOTS: ${{ inputs.directories }}
+          SKIP_MARKER: ${{ inputs.skip-marker }}
+        run: |
+          set -euo pipefail
+
+          existing=()
+          for root in $ROOTS; do
+            if [ -d "$root" ]; then existing+=("$root"); else echo "::notice::'$root' does not exist — skipping."; fi
+          done
+          if [ "${#existing[@]}" -eq 0 ]; then
+            echo "::warning::None of the configured directories exist. Nothing to validate."
+            echo 'directories=[]' >> "$GITHUB_OUTPUT"
+            echo 'count=0' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          dirs=()
+          while IFS= read -r d; do
+            [ -n "$d" ] || continue
+            # Modules that wrap live third-party REST APIs can't be validated offline;
+            # they opt out with a marker file rather than being special-cased here.
+            if [ -f "$d/$SKIP_MARKER" ]; then
+              echo "::notice::skipping $d ($SKIP_MARKER present)"
+              continue
+            fi
+            dirs+=("$d")
+          done < <(find "${existing[@]}" -type f -name '*.tf' -exec dirname {} \; | sort -u)
+
+          if [ "${#dirs[@]}" -eq 0 ]; then
+            echo 'directories=[]' >> "$GITHUB_OUTPUT"
+            echo 'count=0' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          json="$(printf '%s\n' "${dirs[@]}" | jq -R . | jq -sc .)"
+          echo "directories=$json" >> "$GITHUB_OUTPUT"
+          echo "count=${#dirs[@]}" >> "$GITHUB_OUTPUT"
+          echo "Found ${#dirs[@]} directories to validate."
+          printf '  %s\n' "${dirs[@]}"
+
+  fmt:
+    name: fmt
+    if: ${{ inputs.fmt }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Set up Terraform
+        uses: ./.toolkit/actions/setup-terraform
+        with:
+          binary: ${{ inputs.binary }}
+          version: ${{ inputs.version }}
+
+      - name: Check formatting
+        env:
+          TF: ${{ inputs.binary }}
+        run: |
+          set -euo pipefail
+          # `-check` alone prints the file list but not the diff; `-diff` makes the failure
+          # self-explanatory in the log.
+          if ! "$TF" fmt -check -recursive -diff; then
+            echo "::error::Terraform files are not formatted. Run '$TF fmt -recursive' and commit."
+            exit 1
+          fi
+
+  validate:
+    name: validate ${{ matrix.directory }}
+    needs: [discover]
+    if: ${{ inputs.validate && needs.discover.outputs.count != '0' }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    strategy:
+      fail-fast: false
+      # A large monorepo would otherwise queue every module at once and starve the rest of
+      # the pipeline of runners.
+      max-parallel: 8
+      matrix:
+        directory: ${{ fromJSON(needs.discover.outputs.directories) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Set up Terraform
+        uses: ./.toolkit/actions/setup-terraform
+        with:
+          binary: ${{ inputs.binary }}
+          version: ${{ inputs.version }}
+
+      - name: Init and validate
+        working-directory: ${{ matrix.directory }}
+        env:
+          TF: ${{ inputs.binary }}
+        run: |
+          set -euo pipefail
+          # `-backend=false` keeps CI from needing state credentials just to type-check.
+          "$TF" init -backend=false -input=false -no-color
+          "$TF" validate -no-color
+
+  tflint:
+    name: tflint
+    if: ${{ inputs.tflint }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up tflint
+        uses: terraform-linters/setup-tflint@v6
+        with:
+          tflint_version: ${{ inputs.tflint-version }}
+
+      - name: Run tflint
+        run: |
+          set -euo pipefail
+          tflint --init
+          tflint --recursive --format compact
+
+  trivy:
+    name: trivy config scan
+    if: ${{ inputs.trivy }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Scan Terraform configuration
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          format: table
+          severity: ${{ inputs.trivy-severity }}
+          exit-code: ${{ inputs.trivy-fail && '1' || '0' }}
+
+  docs:
+    name: terraform-docs drift
+    if: ${{ inputs.docs-check }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Set up terraform-docs
+        uses: ./.toolkit/actions/setup-terraform
+        with:
+          binary: ${{ inputs.binary }}
+          version: ${{ inputs.version }}
+          terraform-docs: 'true'
+
+      - name: Regenerate and diff
+        env:
+          DOCS_ROOTS: ${{ inputs.docs-directories }}
+        run: |
+          set -euo pipefail
+          for root in $DOCS_ROOTS; do
+            [ -d "$root" ] || continue
+            # `versions.tf` marks a real module; examples and fixtures don't have one.
+            while IFS= read -r dir; do
+              [ -n "$dir" ] || continue
+              terraform-docs markdown table --output-file README.md --output-mode inject "$dir"
+            done < <(find "$root" -mindepth 1 -name versions.tf -exec dirname {} \;)
+          done
+
+          if ! git diff --quiet -- '**/README.md'; then
+            echo "::error::Module docs are stale. Run 'make docs' and commit the result."
+            git diff --stat -- '**/README.md'
+            git diff -- '**/README.md'
+            exit 1
+          fi
+          echo "Module docs are up to date."

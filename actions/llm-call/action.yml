@@ -1,0 +1,440 @@
+# Call an LLM from a workflow step and get back text, token usage, and an estimated cost.
+#
+# This is the single provider seam for every non-agentic LLM use in the toolkit — release
+# note drafting, triage classification, changelog summarisation, eval graders. Adding a
+# provider means editing this file, not every workflow that wants a completion.
+#
+#   openrouter (default) → one API key, hundreds of models, automatic fallback across
+#                          upstream providers. `model` uses OpenRouter's `vendor/model`
+#                          form (`anthropic/claude-sonnet-5`, `openai/gpt-5.2`).
+#   anthropic            → Anthropic Messages API directly.
+#   openai               → OpenAI Chat Completions.
+#   gemini               → Google Generative Language API.
+#   groq | together | deepseek | xai | mistral | ollama | custom
+#                        → OpenAI-compatible `/chat/completions` endpoints. `custom` takes
+#                          an explicit `base-url`, which also covers self-hosted vLLM,
+#                          LM Studio, and LiteLLM proxies.
+#
+# Why OpenRouter is the default: it decouples the workflow from any one vendor's outage,
+# rate limit, or model deprecation, and it reports real spend per request in the response
+# so `cost-usd` is measured rather than estimated. For the direct providers, cost is
+# computed from `price-per-1m-input`/`-output` when you supply them, and omitted otherwise —
+# a wrong number is worse than no number.
+#
+# The prompt is written to a file and posted as JSON built by jq. It is never interpolated
+# into a shell command or a JSON string by hand, so issue titles, PR bodies, and diffs can
+# be passed through safely.
+
+name: LLM call
+description: Send a prompt to OpenRouter, Anthropic, OpenAI, Gemini, or any OpenAI-compatible API
+
+inputs:
+  provider:
+    description: 'openrouter | anthropic | openai | gemini | groq | together | deepseek | xai | mistral | ollama | custom'
+    required: false
+    default: 'openrouter'
+  model:
+    description: 'Model identifier, in the provider''s own naming (e.g. `anthropic/claude-sonnet-5`).'
+    required: true
+  prompt:
+    description: The user message. Mutually exclusive with `prompt-file`.
+    required: false
+    default: ''
+  prompt-file:
+    description: Read the user message from this file. Takes precedence over `prompt`.
+    required: false
+    default: ''
+  system:
+    description: System prompt.
+    required: false
+    default: ''
+  api-key:
+    description: API key for the selected provider. Not required for `ollama`.
+    required: false
+    default: ''
+  base-url:
+    description: 'API base URL. Required for `custom`; overrides the default for any provider.'
+    required: false
+    default: ''
+  max-tokens:
+    description: Maximum tokens to generate.
+    required: false
+    default: '4096'
+  temperature:
+    description: Sampling temperature.
+    required: false
+    default: '0'
+  json-schema:
+    description: |
+      JSON Schema for structured output. When set, the model is constrained to emit
+      conforming JSON and the result is validated before the step succeeds. Supported on
+      openrouter/openai/gemini and the OpenAI-compatible providers.
+    required: false
+    default: ''
+  output-file:
+    description: Write the response text to this file as well as to the step output.
+    required: false
+    default: ''
+  fallback-models:
+    description: |
+      Comma-separated models to try in order if the primary fails. OpenRouter routes these
+      server-side; other providers retry client-side.
+    required: false
+    default: ''
+  price-per-1m-input:
+    description: 'USD per 1M input tokens, for cost reporting on direct providers. Empty omits cost.'
+    required: false
+    default: ''
+  price-per-1m-output:
+    description: USD per 1M output tokens.
+    required: false
+    default: ''
+  retries:
+    description: Retry attempts on 429 or 5xx, with exponential backoff.
+    required: false
+    default: '3'
+  timeout:
+    description: Per-request timeout in seconds.
+    required: false
+    default: '300'
+  fail-on-error:
+    description: 'false to record the failure in outputs and continue instead of failing the step.'
+    required: false
+    default: 'true'
+
+outputs:
+  text:
+    description: The generated text. Empty when the call failed and `fail-on-error` is false.
+    value: ${{ steps.call.outputs.text }}
+  json:
+    description: The parsed JSON object, when `json-schema` was used.
+    value: ${{ steps.call.outputs.json }}
+  output-file:
+    description: Path the response was written to, when `output-file` was set.
+    value: ${{ steps.call.outputs.output_file }}
+  input-tokens:
+    description: Prompt tokens consumed.
+    value: ${{ steps.call.outputs.input_tokens }}
+  output-tokens:
+    description: Completion tokens generated.
+    value: ${{ steps.call.outputs.output_tokens }}
+  cost-usd:
+    description: Cost in USD — reported by OpenRouter, computed from prices elsewhere, else empty.
+    value: ${{ steps.call.outputs.cost_usd }}
+  model:
+    description: The model that actually served the request (may differ if a fallback was used).
+    value: ${{ steps.call.outputs.served_model }}
+  success:
+    description: '`true` if the call returned a completion.'
+    value: ${{ steps.call.outputs.success }}
+
+runs:
+  using: composite
+  steps:
+    - name: Call the model
+      id: call
+      shell: bash
+      env:
+        PROVIDER: ${{ inputs.provider }}
+        MODEL: ${{ inputs.model }}
+        PROMPT: ${{ inputs.prompt }}
+        PROMPT_FILE: ${{ inputs.prompt-file }}
+        SYSTEM: ${{ inputs.system }}
+        API_KEY: ${{ inputs.api-key }}
+        BASE_URL: ${{ inputs.base-url }}
+        MAX_TOKENS: ${{ inputs.max-tokens }}
+        TEMPERATURE: ${{ inputs.temperature }}
+        JSON_SCHEMA: ${{ inputs.json-schema }}
+        OUTPUT_FILE: ${{ inputs.output-file }}
+        FALLBACK_MODELS: ${{ inputs.fallback-models }}
+        PRICE_IN: ${{ inputs.price-per-1m-input }}
+        PRICE_OUT: ${{ inputs.price-per-1m-output }}
+        RETRIES: ${{ inputs.retries }}
+        TIMEOUT: ${{ inputs.timeout }}
+        FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
+        REPO: ${{ github.repository }}
+        SERVER_URL: ${{ github.server_url }}
+      run: |
+        set -euo pipefail
+
+        # ── Resolve the prompt ───────────────────────────────────────────────────
+        if [ -n "$PROMPT_FILE" ]; then
+          [ -f "$PROMPT_FILE" ] || { echo "::error::prompt-file '$PROMPT_FILE' does not exist."; exit 1; }
+          cp "$PROMPT_FILE" /tmp/atk-prompt.txt
+        elif [ -n "$PROMPT" ]; then
+          printf '%s' "$PROMPT" > /tmp/atk-prompt.txt
+        else
+          echo "::error::Provide either prompt or prompt-file."
+          exit 1
+        fi
+
+        # ── Resolve endpoint and auth per provider ───────────────────────────────
+        # `api_style` picks the request/response shape: `openai` covers every
+        # OpenAI-compatible /chat/completions endpoint, which is most of them.
+        api_style=openai
+        auth_header=''
+        extra_headers=()
+
+        case "$PROVIDER" in
+          openrouter)
+            base="${BASE_URL:-https://openrouter.ai/api/v1}"
+            auth_header="Authorization: Bearer ${API_KEY}"
+            # OpenRouter attributes traffic by these; they show up in the dashboard.
+            extra_headers+=(-H "HTTP-Referer: ${SERVER_URL}/${REPO}" -H "X-Title: ${REPO}")
+            ;;
+          anthropic)
+            api_style=anthropic
+            base="${BASE_URL:-https://api.anthropic.com/v1}"
+            auth_header="x-api-key: ${API_KEY}"
+            extra_headers+=(-H "anthropic-version: 2023-06-01")
+            ;;
+          openai)   base="${BASE_URL:-https://api.openai.com/v1}";              auth_header="Authorization: Bearer ${API_KEY}" ;;
+          groq)     base="${BASE_URL:-https://api.groq.com/openai/v1}";         auth_header="Authorization: Bearer ${API_KEY}" ;;
+          together) base="${BASE_URL:-https://api.together.xyz/v1}";            auth_header="Authorization: Bearer ${API_KEY}" ;;
+          deepseek) base="${BASE_URL:-https://api.deepseek.com/v1}";            auth_header="Authorization: Bearer ${API_KEY}" ;;
+          xai)      base="${BASE_URL:-https://api.x.ai/v1}";                    auth_header="Authorization: Bearer ${API_KEY}" ;;
+          mistral)  base="${BASE_URL:-https://api.mistral.ai/v1}";              auth_header="Authorization: Bearer ${API_KEY}" ;;
+          ollama)   base="${BASE_URL:-http://localhost:11434/v1}";              auth_header='' ;;
+          gemini)
+            api_style=gemini
+            base="${BASE_URL:-https://generativelanguage.googleapis.com/v1beta}"
+            auth_header="x-goog-api-key: ${API_KEY}"
+            ;;
+          custom)
+            if [ -z "$BASE_URL" ]; then
+              echo "::error::provider='custom' requires base-url."
+              exit 1
+            fi
+            base="$BASE_URL"
+            auth_header="Authorization: Bearer ${API_KEY}"
+            ;;
+          *)
+            echo "::error::provider='$PROVIDER' is not supported. See the action README for the list."
+            exit 1
+            ;;
+        esac
+
+        if [ -z "$API_KEY" ] && [ "$PROVIDER" != "ollama" ]; then
+          echo "::error::provider='$PROVIDER' requires api-key."
+          exit 1
+        fi
+
+        # ── Build the request body ───────────────────────────────────────────────
+        # jq --rawfile keeps the prompt out of the shell command line entirely, so no
+        # amount of quoting or backticks in it can affect this script.
+        if [ -n "$JSON_SCHEMA" ]; then
+          if ! jq -e . >/dev/null 2>&1 <<< "$JSON_SCHEMA"; then
+            echo "::error::json-schema is not valid JSON."
+            exit 1
+          fi
+        fi
+
+        case "$api_style" in
+          anthropic)
+            url="${base}/messages"
+            jq -n \
+              --arg model "$MODEL" \
+              --arg system "$SYSTEM" \
+              --rawfile prompt /tmp/atk-prompt.txt \
+              --argjson max_tokens "$MAX_TOKENS" \
+              --argjson temperature "$TEMPERATURE" \
+              '{
+                 model: $model,
+                 max_tokens: $max_tokens,
+                 temperature: $temperature,
+                 messages: [{ role: "user", content: $prompt }]
+               }
+               + (if $system != "" then { system: $system } else {} end)' \
+              > /tmp/atk-request.json
+            ;;
+          gemini)
+            url="${base}/models/${MODEL}:generateContent"
+            jq -n \
+              --arg system "$SYSTEM" \
+              --rawfile prompt /tmp/atk-prompt.txt \
+              --argjson max_tokens "$MAX_TOKENS" \
+              --argjson temperature "$TEMPERATURE" \
+              --argjson schema "${JSON_SCHEMA:-null}" \
+              '{
+                 contents: [{ role: "user", parts: [{ text: $prompt }] }],
+                 generationConfig: ({ maxOutputTokens: $max_tokens, temperature: $temperature }
+                   + (if $schema != null
+                      then { responseMimeType: "application/json", responseSchema: $schema }
+                      else {} end))
+               }
+               + (if $system != "" then { systemInstruction: { parts: [{ text: $system }] } } else {} end)' \
+              > /tmp/atk-request.json
+            ;;
+          openai)
+            url="${base}/chat/completions"
+            fallback_json='null'
+            if [ -n "$FALLBACK_MODELS" ]; then
+              fallback_json="$(jq -Rc 'split(",") | map(gsub("^\\s+|\\s+$";"")) | map(select(length > 0))' <<< "$FALLBACK_MODELS")"
+            fi
+            jq -n \
+              --arg model "$MODEL" \
+              --arg system "$SYSTEM" \
+              --rawfile prompt /tmp/atk-prompt.txt \
+              --argjson max_tokens "$MAX_TOKENS" \
+              --argjson temperature "$TEMPERATURE" \
+              --argjson schema "${JSON_SCHEMA:-null}" \
+              --argjson fallbacks "$fallback_json" \
+              --arg provider "$PROVIDER" \
+              '{
+                 model: $model,
+                 max_tokens: $max_tokens,
+                 temperature: $temperature,
+                 messages: (
+                   (if $system != "" then [{ role: "system", content: $system }] else [] end)
+                   + [{ role: "user", content: $prompt }]
+                 )
+               }
+               + (if $schema != null then {
+                    response_format: {
+                      type: "json_schema",
+                      json_schema: { name: "response", strict: true, schema: $schema }
+                    }
+                  } else {} end)
+               # OpenRouter-specific: server-side fallback routing and usage accounting.
+               + (if $provider == "openrouter" then
+                    { usage: { include: true } }
+                    + (if $fallbacks != null then { models: ([$model] + $fallbacks) } else {} end)
+                  else {} end)' \
+              > /tmp/atk-request.json
+            ;;
+        esac
+
+        # ── Send, with backoff on 429/5xx ────────────────────────────────────────
+        curl_args=(-sS --max-time "$TIMEOUT" -X POST "$url"
+                   -H 'Content-Type: application/json'
+                   --data-binary @/tmp/atk-request.json
+                   -o /tmp/atk-response.json -w '%{http_code}')
+        [ -n "$auth_header" ] && curl_args+=(-H "$auth_header")
+        [ "${#extra_headers[@]}" -gt 0 ] && curl_args+=("${extra_headers[@]}")
+
+        http_code=000
+        attempt=0
+        while [ "$attempt" -le "$RETRIES" ]; do
+          if [ "$attempt" -gt 0 ]; then
+            delay=$(( 2 ** attempt ))
+            echo "Retry $attempt/$RETRIES after ${delay}s (last status $http_code)…"
+            sleep "$delay"
+          fi
+          set +e
+          http_code="$(curl "${curl_args[@]}")"
+          curl_status=$?
+          set -e
+
+          if [ "$curl_status" -ne 0 ]; then
+            # Transport-level failure (timeout, DNS, connection reset). Worth retrying,
+            # and `000` must not be compared numerically against 400 — it would look
+            # like a success.
+            http_code=000
+          elif [ "$http_code" -lt 400 ]; then
+            break
+          elif [ "$http_code" -lt 500 ] && [ "$http_code" -ne 429 ]; then
+            # 4xx other than rate limiting won't succeed on retry.
+            break
+          fi
+          attempt=$(( attempt + 1 ))
+        done
+
+        fail() {
+          echo "::error::$1"
+          {
+            echo "success=false"
+            echo "text="
+            echo "json="
+            echo "input_tokens=0"
+            echo "output_tokens=0"
+            echo "cost_usd="
+            echo "served_model="
+            echo "output_file="
+          } >> "$GITHUB_OUTPUT"
+          if [ "$FAIL_ON_ERROR" = "true" ]; then exit 1; fi
+          exit 0
+        }
+
+        if [ "$http_code" -ge 400 ] || [ "$http_code" = "000" ]; then
+          echo "Response body:"
+          head -c 2000 /tmp/atk-response.json || true
+          echo
+          fail "LLM request to $PROVIDER failed with HTTP $http_code after $attempt retries."
+        fi
+
+        # ── Parse the response ───────────────────────────────────────────────────
+        case "$api_style" in
+          anthropic)
+            text="$(jq -r '[.content[]? | select(.type == "text") | .text] | join("")' /tmp/atk-response.json)"
+            input_tokens="$(jq -r '.usage.input_tokens // 0' /tmp/atk-response.json)"
+            output_tokens="$(jq -r '.usage.output_tokens // 0' /tmp/atk-response.json)"
+            served_model="$(jq -r '.model // ""' /tmp/atk-response.json)"
+            reported_cost=''
+            ;;
+          gemini)
+            text="$(jq -r '[.candidates[0].content.parts[]?.text] | join("")' /tmp/atk-response.json)"
+            input_tokens="$(jq -r '.usageMetadata.promptTokenCount // 0' /tmp/atk-response.json)"
+            output_tokens="$(jq -r '.usageMetadata.candidatesTokenCount // 0' /tmp/atk-response.json)"
+            served_model="$MODEL"
+            reported_cost=''
+            ;;
+          openai)
+            text="$(jq -r '.choices[0].message.content // ""' /tmp/atk-response.json)"
+            input_tokens="$(jq -r '.usage.prompt_tokens // 0' /tmp/atk-response.json)"
+            output_tokens="$(jq -r '.usage.completion_tokens // 0' /tmp/atk-response.json)"
+            served_model="$(jq -r '.model // ""' /tmp/atk-response.json)"
+            # OpenRouter returns actual charged cost; other providers don't.
+            reported_cost="$(jq -r '.usage.cost // empty' /tmp/atk-response.json)"
+            ;;
+        esac
+
+        if [ -z "$text" ]; then
+          echo "Response body:"
+          head -c 2000 /tmp/atk-response.json || true
+          echo
+          fail "The model returned an empty completion. It may have hit max-tokens or a content filter."
+        fi
+
+        # ── Structured output validation ─────────────────────────────────────────
+        json_out=''
+        if [ -n "$JSON_SCHEMA" ]; then
+          # Models occasionally wrap JSON in a fenced block even under a schema constraint.
+          cleaned="$(printf '%s' "$text" | sed -e 's/^```json[[:space:]]*//' -e 's/^```[[:space:]]*//' -e 's/```[[:space:]]*$//')"
+          if ! json_out="$(jq -c . <<< "$cleaned" 2>/dev/null)"; then
+            echo "Raw text:"
+            printf '%s\n' "$text" | head -c 2000
+            fail "json-schema was requested but the response is not valid JSON."
+          fi
+        fi
+
+        # ── Cost ─────────────────────────────────────────────────────────────────
+        cost=''
+        if [ -n "$reported_cost" ]; then
+          cost="$reported_cost"
+        elif [ -n "$PRICE_IN" ] && [ -n "$PRICE_OUT" ]; then
+          cost="$(jq -nr --argjson i "$input_tokens" --argjson o "$output_tokens" \
+            --argjson pi "$PRICE_IN" --argjson po "$PRICE_OUT" \
+            '(($i * $pi) + ($o * $po)) / 1000000 | . * 1000000 | round / 1000000')"
+        fi
+
+        output_file_path=''
+        if [ -n "$OUTPUT_FILE" ]; then
+          mkdir -p "$(dirname "$OUTPUT_FILE")"
+          printf '%s' "$text" > "$OUTPUT_FILE"
+          output_file_path="$OUTPUT_FILE"
+        fi
+
+        {
+          echo 'text<<__ATK_EOF__'
+          printf '%s\n' "$text"
+          echo '__ATK_EOF__'
+          echo "json=$json_out"
+          echo "input_tokens=$input_tokens"
+          echo "output_tokens=$output_tokens"
+          echo "cost_usd=$cost"
+          echo "served_model=$served_model"
+          echo "output_file=$output_file_path"
+          echo "success=true"
+        } >> "$GITHUB_OUTPUT"
+
+        echo "::notice::${PROVIDER}/${served_model:-$MODEL} — ${input_tokens} in, ${output_tokens} out${cost:+, \$${cost}}"

@@ -1,0 +1,11 @@
+{
+  "name": "atk-fixture-node-pnpm",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Fixture for self-CI: exercises pnpm detection, install, test, and build.",
+  "packageManager": "pnpm@10.11.0",
+  "scripts": {
+    "test": "node --test",
+    "build": "node -e \"require('node:fs').mkdirSync('dist',{recursive:true});require('node:fs').writeFileSync('dist/index.js','export const ok = true;\\n')\""
+  }
+}

@@ -1,0 +1,116 @@
+# Terraform or OpenTofu setup with version resolution from the repo.
+#
+# The binary is a parameter, not a hardcode, so the same pipelines serve Terraform and
+# OpenTofu repos. Version resolution order: explicit input → `.terraform-version` /
+# `.opentofu-version` → `latest`. tf-tools pins in `.terraform-version`, so the default
+# `auto` picks that up with no configuration.
+#
+# `wrapper: false` by default. The HashiCorp wrapper captures stdout into step outputs,
+# which is handy for PR comments but silently truncates large plans and interferes with
+# exit codes; the plan action in this toolkit captures output itself.
+
+name: Setup Terraform
+description: Install Terraform or OpenTofu at a version resolved from the repo
+
+inputs:
+  binary:
+    description: 'terraform | tofu'
+    required: false
+    default: 'terraform'
+  version:
+    description: 'Version to install, or `auto` to read `.terraform-version`/`.opentofu-version`, or `latest`.'
+    required: false
+    default: 'auto'
+  wrapper:
+    description: 'true to install the stdout-capturing wrapper. Off by default.'
+    required: false
+    default: 'false'
+  working-directory:
+    description: Directory used to look for the version file.
+    required: false
+    default: '.'
+  tflint:
+    description: 'true to also install tflint.'
+    required: false
+    default: 'false'
+  tflint-version:
+    description: tflint version. `latest` unless pinned.
+    required: false
+    default: 'latest'
+  terraform-docs:
+    description: 'true to also install terraform-docs.'
+    required: false
+    default: 'false'
+
+outputs:
+  binary:
+    description: The binary name to invoke (`terraform` or `tofu`).
+    value: ${{ inputs.binary }}
+  version:
+    description: The resolved version string.
+    value: ${{ steps.resolve.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve version
+      id: resolve
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        BINARY: ${{ inputs.binary }}
+        REQUESTED: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+
+        case "$BINARY" in
+          terraform) version_file=.terraform-version ;;
+          tofu)      version_file=.opentofu-version ;;
+          *) echo "::error::binary='$BINARY' is not supported (terraform|tofu)."; exit 1 ;;
+        esac
+
+        version="$REQUESTED"
+        if [ "$version" = "auto" ]; then
+          if [ -f "$version_file" ]; then
+            version="$(tr -d '[:space:]' < "$version_file")"
+            echo "Resolved $version from $version_file"
+          else
+            version=latest
+            echo "::notice::No $version_file found — installing latest $BINARY."
+          fi
+        fi
+
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
+    - name: Set up Terraform
+      if: inputs.binary == 'terraform'
+      uses: hashicorp/setup-terraform@v4
+      with:
+        terraform_version: ${{ steps.resolve.outputs.version }}
+        terraform_wrapper: ${{ inputs.wrapper }}
+
+    - name: Set up OpenTofu
+      if: inputs.binary == 'tofu'
+      uses: opentofu/setup-opentofu@v2
+      with:
+        tofu_version: ${{ steps.resolve.outputs.version }}
+        tofu_wrapper: ${{ inputs.wrapper }}
+
+    - name: Set up tflint
+      if: inputs.tflint == 'true'
+      uses: terraform-linters/setup-tflint@v6
+      with:
+        tflint_version: ${{ inputs.tflint-version }}
+
+    - name: Set up terraform-docs
+      if: inputs.terraform-docs == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        # terraform-docs has no maintained setup action; the release tarball is small and
+        # this avoids taking a dependency on an unmaintained wrapper.
+        version="$(curl -fsSL https://api.github.com/repos/terraform-docs/terraform-docs/releases/latest | jq -r .tag_name)"
+        curl -fsSL "https://github.com/terraform-docs/terraform-docs/releases/download/${version}/terraform-docs-${version}-linux-amd64.tar.gz" \
+          | tar -xz -C /tmp terraform-docs
+        install -m 0755 /tmp/terraform-docs /usr/local/bin/terraform-docs
+        terraform-docs --version
