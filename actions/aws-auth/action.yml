@@ -1,0 +1,101 @@
+# Authenticate to AWS, OIDC-first.
+#
+# OIDC is the default and the documented path: the job exchanges its GitHub identity token
+# for short-lived STS credentials, so there is no long-lived access key in the repo at all.
+# It needs `permissions: id-token: write` on the job and a role whose trust policy accepts
+# `token.actions.githubusercontent.com` scoped to this repo — see docs/SECURITY.md for the
+# trust policy and the matching tf-tools module.
+#
+# Static keys still work for the cases OIDC can't cover (a third-party account you don't
+# control the IAM of), but the action emits a warning so it never becomes the silent
+# default.
+
+name: AWS auth
+description: Assume an AWS role via GitHub OIDC, or fall back to static access keys
+
+inputs:
+  role-to-assume:
+    description: ARN of the role to assume via OIDC. Preferred over static keys.
+    required: false
+    default: ''
+  aws-region:
+    description: AWS region for the session.
+    required: true
+  role-session-name:
+    description: STS session name. Defaults to a run-identifying name.
+    required: false
+    default: ''
+  role-duration-seconds:
+    description: Session lifetime. Keep it just longer than the job.
+    required: false
+    default: '3600'
+  role-external-id:
+    description: External ID, when the target role's trust policy requires one.
+    required: false
+    default: ''
+  aws-access-key-id:
+    description: Static access key. Only used when `role-to-assume` is empty.
+    required: false
+    default: ''
+  aws-secret-access-key:
+    description: Static secret key. Only used when `role-to-assume` is empty.
+    required: false
+    default: ''
+  aws-session-token:
+    description: Session token, for temporary static credentials.
+    required: false
+    default: ''
+  mask-account-id:
+    description: 'true to mask the account ID in logs.'
+    required: false
+    default: 'true'
+  ecr-login:
+    description: 'true to also log Docker in to ECR in this account.'
+    required: false
+    default: 'false'
+
+outputs:
+  account-id:
+    description: The authenticated AWS account ID (masked in logs when `mask-account-id`).
+    value: ${{ steps.creds.outputs.aws-account-id }}
+  ecr-registry:
+    description: 'ECR registry host (`<account>.dkr.ecr.<region>.amazonaws.com`), when `ecr-login` ran.'
+    value: ${{ steps.ecr.outputs.registry }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate credentials
+      shell: bash
+      env:
+        ROLE: ${{ inputs.role-to-assume }}
+        KEY_ID: ${{ inputs.aws-access-key-id }}
+      run: |
+        set -euo pipefail
+        if [ -z "$ROLE" ] && [ -z "$KEY_ID" ]; then
+          echo "::error::No AWS credentials provided. Set role-to-assume (OIDC, preferred) or aws-access-key-id."
+          exit 1
+        fi
+        if [ -z "$ROLE" ]; then
+          echo "::warning::Authenticating with a long-lived AWS access key. Prefer OIDC (role-to-assume) — see docs/SECURITY.md."
+        fi
+
+    - name: Configure AWS credentials
+      id: creds
+      uses: aws-actions/configure-aws-credentials@v6
+      with:
+        aws-region: ${{ inputs.aws-region }}
+        role-to-assume: ${{ inputs.role-to-assume }}
+        role-session-name: ${{ inputs.role-session-name || format('gha-{0}-{1}', github.run_id, github.run_attempt) }}
+        role-duration-seconds: ${{ inputs.role-duration-seconds }}
+        role-external-id: ${{ inputs.role-external-id }}
+        aws-access-key-id: ${{ inputs.aws-access-key-id }}
+        aws-secret-access-key: ${{ inputs.aws-secret-access-key }}
+        aws-session-token: ${{ inputs.aws-session-token }}
+        mask-aws-account-id: ${{ inputs.mask-account-id }}
+        output-credentials: true
+
+    - name: Log in to Amazon ECR
+      id: ecr
+      if: inputs.ecr-login == 'true'
+      uses: aws-actions/amazon-ecr-login@v2
