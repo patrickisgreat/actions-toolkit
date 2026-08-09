@@ -1,0 +1,21 @@
+{
+  "name": "actions-toolkit",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Tooling for developing actions-toolkit itself. Consumers never install this.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "docs": "node scripts/gen-docs.mjs",
+    "docs:check": "node scripts/gen-docs.mjs --check",
+    "lint": "actionlint && yamllint -c .yamllint.yml .github actions",
+    "validate": "node scripts/validate-manifests.mjs"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^19.6.0",
+    "@commitlint/config-conventional": "^19.6.0",
+    "yaml": "^2.6.1"
+  }
+}

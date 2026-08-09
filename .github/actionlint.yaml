@@ -1,0 +1,19 @@
+# actionlint configuration.
+#
+# See docs/AUTHORING.md for why each exception exists. Every entry here is a known gap in
+# actionlint's model, not a rule we're opting out of — anything actionlint is right about
+# gets fixed in the workflow instead.
+
+paths:
+  .github/workflows/**/*.yml:
+    ignore:
+      # `github.job_workflow_sha` is a documented context property (the commit SHA of the
+      # reusable workflow file currently executing). actionlint's built-in `github` context
+      # type predates it, so every `.toolkit` checkout — the mechanism the whole repo is
+      # built on, see CLAUDE.md — trips this. Track:
+      # https://docs.github.com/actions/reference/contexts-reference#github-context
+      - 'property "job_workflow_sha" is not defined'
+
+      # Reusable workflows here take credentials as optional `secrets:` and pass them
+      # straight through to an action. actionlint can't know a caller will supply them.
+      - 'secret "[A-Z_]+" is not defined'

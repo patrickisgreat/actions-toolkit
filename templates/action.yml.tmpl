@@ -1,0 +1,33 @@
+# <one-paragraph description of what this action does and when to reach for it>
+#
+# Conventions this file must follow (see docs/AUTHORING.md):
+#   • Every input has a `description` and, unless genuinely required, a `default`.
+#   • Never interpolate `${{ }}` into a `run:` body — pass through `env:` instead.
+#   • Every `run:` starts with `set -euo pipefail`.
+#   • Third-party actions are pinned to a major tag at minimum.
+
+name: __NAME__
+description: <one line, imperative, ends without a period>
+
+inputs:
+  example:
+    description: What this controls.
+    required: false
+    default: ''
+
+outputs:
+  example:
+    description: What this returns.
+    value: ${{ steps.main.outputs.example }}
+
+runs:
+  using: composite
+  steps:
+    - name: Do the thing
+      id: main
+      shell: bash
+      env:
+        EXAMPLE: ${{ inputs.example }}
+      run: |
+        set -euo pipefail
+        echo "example=$EXAMPLE" >> "$GITHUB_OUTPUT"

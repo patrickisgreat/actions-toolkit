@@ -1,0 +1,36 @@
+version: 2
+updates:
+  # Keeps the third-party actions this toolkit wraps current. Because every
+  # consumer inherits our pins, this is the single most valuable supply-chain
+  # hygiene job in the repo.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: 'chore(deps)'
+    groups:
+      actions:
+        patterns:
+          - '*'
+
+  # Composite actions live outside .github/, so each needs its own entry for
+  # Dependabot to see the `uses:` lines inside them.
+  - package-ecosystem: github-actions
+    directories:
+      - /actions/*
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: 'chore(deps)'
+    groups:
+      composite-actions:
+        patterns:
+          - '*'
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: 'chore(deps)'
