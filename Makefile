@@ -10,13 +10,13 @@
 # noise would hide the findings that matter.
 export SHELLCHECK_OPTS := --exclude=SC2016
 
-.PHONY: help lint actionlint yamllint shellcheck validate docs docs-check test new-action all
+.PHONY: help lint actionlint yamllint shellcheck validate check-refs docs docs-check test new-action all
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 	  awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
-all: lint validate docs-check ## Everything CI runs
+all: lint validate check-refs docs-check ## Everything CI runs
 
 lint: actionlint yamllint shellcheck ## Run every linter
 
@@ -32,6 +32,9 @@ shellcheck: ## Lint every `run:` block via actionlint's shellcheck integration
 
 validate: ## Structural checks on action.yml / workflow_call contracts
 	node scripts/validate-manifests.mjs
+
+check-refs: ## Verify every third-party `uses:` ref actually resolves (needs gh)
+	./scripts/check-action-refs.sh
 
 docs: ## Regenerate per-action READMEs and the root catalog table
 	node scripts/gen-docs.mjs

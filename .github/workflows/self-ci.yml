@@ -86,6 +86,15 @@ jobs:
           set -euo pipefail
           node scripts/gen-docs.mjs --check
 
+      - name: Check that every action ref resolves
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # No linter talks to GitHub, so a pin to a tag that does not exist is invisible
+          # until the step runs — potentially in a consumer's deploy pipeline.
+          ./scripts/check-action-refs.sh
+
   commitlint:
     name: Commit messages
     if: github.event_name == 'pull_request'
