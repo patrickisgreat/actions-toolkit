@@ -1,0 +1,257 @@
+# Run `terraform plan` and turn it into something a human can review on a PR.
+#
+# What it produces beyond a raw plan:
+#   • A saved binary plan file, so apply runs *exactly* what was reviewed rather than
+#     re-planning against state that may have moved. This is the whole point of separating
+#     plan from apply.
+#   • `has-changes`, derived from `-detailed-exitcode`, so an apply job can skip itself
+#     entirely when there is nothing to do.
+#   • Add/change/destroy counts and a fenced, collapsible Markdown body written to a file,
+#     ready to hand to the `pr-comment` action.
+#   • A `destroys` flag, because "this plan deletes things" is the one signal worth gating
+#     an environment on.
+#
+# Init runs with whatever backend config you pass. Credentials come from a prior `aws-auth`
+# / `gcp-auth` step; this action never handles them.
+
+name: Terraform plan
+description: Plan a Terraform/OpenTofu root and render a reviewable summary
+
+inputs:
+  working-directory:
+    description: Root module directory to plan.
+    required: true
+  binary:
+    description: 'terraform | tofu'
+    required: false
+    default: 'terraform'
+  init-args:
+    description: Extra args appended to `init`.
+    required: false
+    default: ''
+  backend-config:
+    description: |
+      Newline-separated `key=value` backend settings, or paths to `.hcl` files. Each
+      becomes a `-backend-config=` flag.
+    required: false
+    default: ''
+  workspace:
+    description: Workspace to select or create. Empty uses `default`.
+    required: false
+    default: ''
+  var-files:
+    description: Newline-separated `.tfvars` paths, each passed as `-var-file`.
+    required: false
+    default: ''
+  vars:
+    description: Newline-separated `key=value` pairs, each passed as `-var`.
+    required: false
+    default: ''
+  target:
+    description: Newline-separated resource addresses to `-target`. Use sparingly.
+    required: false
+    default: ''
+  destroy:
+    description: 'true to plan a destroy.'
+    required: false
+    default: 'false'
+  refresh:
+    description: 'false to plan with `-refresh=false` (faster, riskier).'
+    required: false
+    default: 'true'
+  plan-file:
+    description: Path for the saved binary plan, relative to `working-directory`.
+    required: false
+    default: 'tfplan.binary'
+  plan-args:
+    description: Extra args appended to `plan`.
+    required: false
+    default: ''
+  max-comment-chars:
+    description: Truncate the rendered plan body to this many characters.
+    required: false
+    default: '50000'
+
+outputs:
+  exit-code:
+    description: '`-detailed-exitcode` result: `0` no changes, `2` changes. `1` fails the step.'
+    value: ${{ steps.plan.outputs.exit_code }}
+  has-changes:
+    description: '`true` when the plan contains changes.'
+    value: ${{ steps.plan.outputs.has_changes }}
+  destroys:
+    description: '`true` when the plan destroys at least one resource.'
+    value: ${{ steps.plan.outputs.destroys }}
+  add:
+    description: Count of resources to add.
+    value: ${{ steps.plan.outputs.add }}
+  change:
+    description: Count of resources to change.
+    value: ${{ steps.plan.outputs.change }}
+  destroy:
+    description: Count of resources to destroy.
+    value: ${{ steps.plan.outputs.destroy }}
+  plan-file:
+    description: Path to the saved binary plan, relative to the workspace root.
+    value: ${{ steps.plan.outputs.plan_path }}
+  comment-body-file:
+    description: Path to a Markdown file summarizing the plan, for `pr-comment`.
+    value: ${{ steps.plan.outputs.comment_file }}
+
+runs:
+  using: composite
+  steps:
+    - name: Plan
+      id: plan
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        TF: ${{ inputs.binary }}
+        WORKDIR: ${{ inputs.working-directory }}
+        INIT_ARGS: ${{ inputs.init-args }}
+        BACKEND_CONFIG: ${{ inputs.backend-config }}
+        WORKSPACE: ${{ inputs.workspace }}
+        VAR_FILES: ${{ inputs.var-files }}
+        TF_VARS: ${{ inputs.vars }}
+        TARGETS: ${{ inputs.target }}
+        DESTROY: ${{ inputs.destroy }}
+        REFRESH: ${{ inputs.refresh }}
+        PLAN_FILE: ${{ inputs.plan-file }}
+        PLAN_ARGS: ${{ inputs.plan-args }}
+        MAX_CHARS: ${{ inputs.max-comment-chars }}
+        # Terraform's own colour codes make the PR comment unreadable.
+        TF_IN_AUTOMATION: 'true'
+        TF_INPUT: '0'
+      run: |
+        set -euo pipefail
+
+        # ── init ─────────────────────────────────────────────────────────────────
+        init=(init -input=false -no-color)
+        if [ -n "$BACKEND_CONFIG" ]; then
+          while IFS= read -r entry; do
+            [ -n "$entry" ] || continue
+            case "$entry" in \#*) continue ;; esac
+            init+=("-backend-config=$entry")
+          done <<< "$BACKEND_CONFIG"
+        fi
+        # shellcheck disable=SC2086
+        echo "::group::$TF init"
+        "$TF" "${init[@]}" $INIT_ARGS
+        echo "::endgroup::"
+
+        # ── workspace ────────────────────────────────────────────────────────────
+        if [ -n "$WORKSPACE" ]; then
+          "$TF" workspace select -or-create "$WORKSPACE" -no-color
+          echo "Workspace: $WORKSPACE"
+        fi
+
+        # ── plan ─────────────────────────────────────────────────────────────────
+        plan=(plan -input=false -no-color -detailed-exitcode -out="$PLAN_FILE")
+        [ "$DESTROY" = "true" ] && plan+=(-destroy)
+        [ "$REFRESH" = "false" ] && plan+=(-refresh=false)
+
+        if [ -n "$VAR_FILES" ]; then
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            case "$f" in \#*) continue ;; esac
+            [ -f "$f" ] || { echo "::error::var-file '$f' does not exist."; exit 1; }
+            plan+=("-var-file=$f")
+          done <<< "$VAR_FILES"
+        fi
+        if [ -n "$TF_VARS" ]; then
+          while IFS= read -r v; do
+            [ -n "$v" ] || continue
+            case "$v" in \#*) continue ;; esac
+            plan+=("-var=$v")
+          done <<< "$TF_VARS"
+        fi
+        if [ -n "$TARGETS" ]; then
+          while IFS= read -r t; do
+            [ -n "$t" ] || continue
+            case "$t" in \#*) continue ;; esac
+            plan+=("-target=$t")
+          done <<< "$TARGETS"
+        fi
+
+        # -detailed-exitcode returns 2 for "changes present", which is success, not
+        # failure — so the exit code has to be captured rather than allowed to trip `set -e`.
+        set +e
+        # shellcheck disable=SC2086
+        "$TF" "${plan[@]}" $PLAN_ARGS > /tmp/atk-plan-raw.txt 2>&1
+        exit_code=$?
+        set -e
+
+        cat /tmp/atk-plan-raw.txt
+
+        if [ "$exit_code" -eq 1 ]; then
+          echo "::error::$TF plan failed in $WORKDIR."
+          exit 1
+        fi
+
+        has_changes=false
+        [ "$exit_code" -eq 2 ] && has_changes=true
+
+        # ── counts ───────────────────────────────────────────────────────────────
+        # Read them from the JSON plan rather than scraping the human summary line,
+        # which is absent when there are no changes and formatted differently across
+        # versions.
+        add=0; change=0; destroy_count=0
+        if [ "$has_changes" = "true" ]; then
+          "$TF" show -json "$PLAN_FILE" > /tmp/atk-plan.json
+          read -r add change destroy_count <<< "$(jq -r '
+            [.resource_changes // [] | .[] | .change.actions] as $a
+            | [
+                ([$a[] | select(index("create") and (index("delete") | not))] | length),
+                ([$a[] | select(index("update"))] | length),
+                ([$a[] | select(index("delete"))] | length)
+              ] | @tsv' /tmp/atk-plan.json | tr '\t' ' ')"
+        fi
+
+        destroys=false
+        [ "${destroy_count:-0}" -gt 0 ] && destroys=true
+
+        # ── rendered comment body ────────────────────────────────────────────────
+        # Strip the refresh chatter; it is the bulk of a long plan and never the part
+        # anyone reads.
+        sed -e '/^.*: Refreshing state\.\.\..*$/d' \
+            -e '/^.*: Reading\.\.\..*$/d' \
+            -e '/^.*: Read complete after.*$/d' \
+            /tmp/atk-plan-raw.txt > /tmp/atk-plan-clean.txt
+
+        plan_body="$(cat /tmp/atk-plan-clean.txt)"
+        truncated=''
+        if [ "${#plan_body}" -gt "$MAX_CHARS" ]; then
+          # Keep the tail: the actual diff and the summary line live at the end.
+          plan_body="${plan_body: -$MAX_CHARS}"
+          truncated=$'\n> ⚠️ Output truncated to the last '"$MAX_CHARS"$' characters. Full plan is in the run log and the uploaded artifact.\n'
+        fi
+
+        if [ "$has_changes" = "true" ]; then
+          if [ "$destroys" = "true" ]; then verdict="⚠️ **${add} to add, ${change} to change, ${destroy_count} to destroy**"
+          else verdict="📋 **${add} to add, ${change} to change, ${destroy_count} to destroy**"; fi
+        else
+          verdict='✅ **No changes.** Infrastructure matches the configuration.'
+        fi
+
+        comment_file=/tmp/atk-plan-comment.md
+        {
+          printf '### Terraform plan — `%s`\n\n' "$WORKDIR"
+          printf '%s\n' "$verdict"
+          printf '%s' "$truncated"
+          printf '\n<details><summary>Show plan</summary>\n\n```terraform\n'
+          printf '%s\n' "$plan_body"
+          printf '```\n\n</details>\n'
+        } > "$comment_file"
+
+        {
+          echo "exit_code=$exit_code"
+          echo "has_changes=$has_changes"
+          echo "destroys=$destroys"
+          echo "add=$add"
+          echo "change=$change"
+          echo "destroy=$destroy_count"
+          echo "plan_path=$WORKDIR/$PLAN_FILE"
+          echo "comment_file=$comment_file"
+        } >> "$GITHUB_OUTPUT"
+
+        cat "$comment_file" >> "$GITHUB_STEP_SUMMARY"

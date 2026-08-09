@@ -1,0 +1,188 @@
+# Apply a Terraform/OpenTofu change — by default, the exact plan that was reviewed.
+#
+# `plan-file` is the intended path: a plan produced and reviewed earlier, downloaded as an
+# artifact, applied verbatim. Terraform refuses a stale saved plan if state moved
+# underneath it, which is the safety property you actually want — the alternative
+# (re-planning at apply time) silently applies something nobody looked at.
+#
+# `plan-file: ''` falls back to a fresh `apply -auto-approve`. That's appropriate for
+# environments where plan review isn't a gate, and the action says so in the log.
+#
+# `init` still has to run in the apply job: a downloaded plan file is useless without the
+# provider plugins and backend the job needs to talk to state.
+
+name: Terraform apply
+description: Apply a saved Terraform/OpenTofu plan, or run a fresh auto-approved apply
+
+inputs:
+  working-directory:
+    description: Root module directory to apply.
+    required: true
+  binary:
+    description: 'terraform | tofu'
+    required: false
+    default: 'terraform'
+  plan-file:
+    description: |
+      Saved binary plan to apply, relative to `working-directory`. Empty runs a fresh
+      `apply -auto-approve` instead.
+    required: false
+    default: 'tfplan.binary'
+  init-args:
+    description: Extra args appended to `init`.
+    required: false
+    default: ''
+  backend-config:
+    description: Newline-separated `key=value` backend settings or `.hcl` paths.
+    required: false
+    default: ''
+  workspace:
+    description: Workspace to select. Must match the one the plan was made in.
+    required: false
+    default: ''
+  var-files:
+    description: Newline-separated `.tfvars` paths. Only used for a fresh apply.
+    required: false
+    default: ''
+  vars:
+    description: Newline-separated `key=value` pairs. Only used for a fresh apply.
+    required: false
+    default: ''
+  destroy:
+    description: 'true to destroy. Only used for a fresh apply.'
+    required: false
+    default: 'false'
+  parallelism:
+    description: Concurrent resource operations.
+    required: false
+    default: '10'
+  apply-args:
+    description: Extra args appended to `apply`.
+    required: false
+    default: ''
+  outputs-file:
+    description: Write root module outputs as JSON to this path. Empty to skip.
+    required: false
+    default: ''
+
+outputs:
+  outputs-json:
+    description: |
+      Root module outputs as a compact JSON object. Values marked `sensitive` in Terraform
+      are replaced with `null` — GitHub does not mask step outputs, so sensitive values
+      must not travel this way.
+    value: ${{ steps.apply.outputs.outputs_json }}
+  outputs-file:
+    description: Path the full outputs JSON was written to, when requested.
+    value: ${{ steps.apply.outputs.outputs_file }}
+
+runs:
+  using: composite
+  steps:
+    - name: Apply
+      id: apply
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        TF: ${{ inputs.binary }}
+        WORKDIR: ${{ inputs.working-directory }}
+        PLAN_FILE: ${{ inputs.plan-file }}
+        INIT_ARGS: ${{ inputs.init-args }}
+        BACKEND_CONFIG: ${{ inputs.backend-config }}
+        WORKSPACE: ${{ inputs.workspace }}
+        VAR_FILES: ${{ inputs.var-files }}
+        TF_VARS: ${{ inputs.vars }}
+        DESTROY: ${{ inputs.destroy }}
+        PARALLELISM: ${{ inputs.parallelism }}
+        APPLY_ARGS: ${{ inputs.apply-args }}
+        OUTPUTS_FILE: ${{ inputs.outputs-file }}
+        TF_IN_AUTOMATION: 'true'
+        TF_INPUT: '0'
+      run: |
+        set -euo pipefail
+
+        # ── init (required even when applying a saved plan) ───────────────────────
+        init=(init -input=false -no-color)
+        if [ -n "$BACKEND_CONFIG" ]; then
+          while IFS= read -r entry; do
+            [ -n "$entry" ] || continue
+            case "$entry" in \#*) continue ;; esac
+            init+=("-backend-config=$entry")
+          done <<< "$BACKEND_CONFIG"
+        fi
+        echo "::group::$TF init"
+        # shellcheck disable=SC2086
+        "$TF" "${init[@]}" $INIT_ARGS
+        echo "::endgroup::"
+
+        if [ -n "$WORKSPACE" ]; then
+          "$TF" workspace select "$WORKSPACE" -no-color
+          echo "Workspace: $WORKSPACE"
+        fi
+
+        # ── apply ────────────────────────────────────────────────────────────────
+        apply=(apply -input=false -no-color -parallelism="$PARALLELISM")
+
+        if [ -n "$PLAN_FILE" ]; then
+          if [ ! -f "$PLAN_FILE" ]; then
+            echo "::error::plan-file '$PLAN_FILE' not found in $WORKDIR. Did the download-artifact step run with the right path?"
+            exit 1
+          fi
+          # A saved plan already encodes vars, targets, and destroy; passing them again is
+          # an error, so they are deliberately not forwarded here.
+          apply+=("$PLAN_FILE")
+          echo "Applying the reviewed plan $PLAN_FILE"
+        else
+          echo "::warning::No plan-file given — running a fresh auto-approved apply. Nobody reviewed this diff."
+          apply+=(-auto-approve)
+          [ "$DESTROY" = "true" ] && apply+=(-destroy)
+          if [ -n "$VAR_FILES" ]; then
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              case "$f" in \#*) continue ;; esac
+              apply+=("-var-file=$f")
+            done <<< "$VAR_FILES"
+          fi
+          if [ -n "$TF_VARS" ]; then
+            while IFS= read -r v; do
+              [ -n "$v" ] || continue
+              case "$v" in \#*) continue ;; esac
+              apply+=("-var=$v")
+            done <<< "$TF_VARS"
+          fi
+        fi
+
+        # shellcheck disable=SC2086
+        "$TF" "${apply[@]}" $APPLY_ARGS
+
+        # ── outputs ──────────────────────────────────────────────────────────────
+        "$TF" output -json > /tmp/atk-tf-outputs.json
+
+        # Step outputs are not masked by GitHub, so sensitive values are nulled out here
+        # rather than being written into the workflow's output graph.
+        redacted="$(jq -c 'with_entries(.value = (if .value.sensitive then null else .value.value end))' \
+          /tmp/atk-tf-outputs.json)"
+
+        outputs_file=''
+        if [ -n "$OUTPUTS_FILE" ]; then
+          cp /tmp/atk-tf-outputs.json "$OUTPUTS_FILE"
+          outputs_file="$OUTPUTS_FILE"
+          echo "Wrote outputs to $OUTPUTS_FILE"
+        fi
+
+        {
+          echo "outputs_json=$redacted"
+          echo "outputs_file=$outputs_file"
+        } >> "$GITHUB_OUTPUT"
+
+        {
+          echo "### 🏗️ Terraform apply — \`${WORKDIR}\`"
+          echo
+          echo "Applied successfully."
+          echo
+          echo "Non-sensitive outputs:"
+          echo '```json'
+          jq 'with_entries(.value = (if .value.sensitive then "<sensitive>" else .value.value end))' \
+            /tmp/atk-tf-outputs.json
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
