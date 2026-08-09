@@ -1,0 +1,157 @@
+# Work out what actually changed, so downstream jobs can skip themselves.
+#
+# Two things at once, because monorepo pipelines always need both:
+#
+#   1. Named boolean filters (`filters:` in dorny/paths-filter syntax) → one output per
+#      filter, for `if:` gating a job.
+#   2. A JSON array of changed leaf directories matching a glob → feed straight into a
+#      `strategy.matrix`, so a Terraform monorepo plans only the roots that moved.
+#
+# Diff base: for a PR it's the merge base with the target branch; for a push it's the
+# previous commit (`before`), falling back to `HEAD~1` on first-push and force-push cases
+# where `before` is the all-zeroes SHA.
+#
+# Requires a checkout with `fetch-depth: 0` for the directory matrix to be accurate.
+
+name: Changed files
+description: Emit path filters and a changed-directory matrix for conditional monorepo jobs
+
+inputs:
+  filters:
+    description: |
+      dorny/paths-filter YAML mapping filter names to path globs. Each name becomes an
+      output. Empty skips the filter step.
+    required: false
+    default: ''
+  matrix-glob:
+    description: |
+      Shell glob matched against changed files; the *directories* of the matches are
+      emitted as `directories`. Example: `modules/**` or `services/*/**`.
+    required: false
+    default: ''
+  matrix-marker:
+    description: |
+      Only emit a directory if it (or an ancestor up to the repo root) contains this file.
+      Use `main.tf` to collapse changed sub-files onto their Terraform root, or leave empty
+      to emit the literal parent directory of each changed file.
+    required: false
+    default: ''
+  base:
+    description: Explicit diff base ref/SHA. Empty auto-detects from the event.
+    required: false
+    default: ''
+  github-token:
+    description: Token used by the filter step to read the PR when no full history exists.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  changes:
+    description: JSON array of the filter names that matched. Empty array when no filters.
+    value: ${{ steps.filter.outputs.changes || '[]' }}
+  directories:
+    description: JSON array of changed directories matching `matrix-glob`.
+    value: ${{ steps.dirs.outputs.directories }}
+  directories-count:
+    description: Number of entries in `directories`, as a string.
+    value: ${{ steps.dirs.outputs.count }}
+  any-changed:
+    description: '`true` when at least one tracked file changed.'
+    value: ${{ steps.dirs.outputs.any_changed }}
+  base:
+    description: The diff base that was used.
+    value: ${{ steps.dirs.outputs.base }}
+
+runs:
+  using: composite
+  steps:
+    - name: Apply path filters
+      id: filter
+      if: inputs.filters != ''
+      uses: dorny/paths-filter@v4
+      with:
+        token: ${{ inputs.github-token }}
+        filters: ${{ inputs.filters }}
+        base: ${{ inputs.base }}
+
+    - name: Compute changed directories
+      id: dirs
+      shell: bash
+      env:
+        MATRIX_GLOB: ${{ inputs.matrix-glob }}
+        MATRIX_MARKER: ${{ inputs.matrix-marker }}
+        EXPLICIT_BASE: ${{ inputs.base }}
+        EVENT_NAME: ${{ github.event_name }}
+        BASE_REF: ${{ github.event.pull_request.base.sha }}
+        BEFORE_SHA: ${{ github.event.before }}
+      run: |
+        set -euo pipefail
+
+        # ── Resolve the diff base ────────────────────────────────────────────────
+        base="$EXPLICIT_BASE"
+        if [ -z "$base" ]; then
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "pull_request_target" ]; then
+            base="$BASE_REF"
+          elif [ -n "${BEFORE_SHA:-}" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            base="$BEFORE_SHA"
+          fi
+        fi
+        # First push to a branch, a force-push that rewrote the base away, or a shallow
+        # clone: fall back to the parent commit. On a root commit there is no parent, and
+        # we treat every tracked file as changed.
+        if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+          if git rev-parse --verify --quiet HEAD~1 >/dev/null; then
+            base="$(git rev-parse HEAD~1)"
+            echo "::notice::Diff base unavailable — falling back to HEAD~1 ($base)."
+          else
+            base=''
+            echo "::notice::No diff base available — treating all tracked files as changed."
+          fi
+        fi
+
+        if [ -n "$base" ]; then
+          git diff --name-only --diff-filter=ACMRT "$base" HEAD > /tmp/atk-changed.txt
+        else
+          git ls-files > /tmp/atk-changed.txt
+        fi
+
+        if [ -s /tmp/atk-changed.txt ]; then any_changed=true; else any_changed=false; fi
+        echo "Changed files ($(wc -l < /tmp/atk-changed.txt)):"
+        sed 's/^/  /' /tmp/atk-changed.txt
+
+        # ── Build the directory matrix ───────────────────────────────────────────
+        directories='[]'
+        count=0
+        if [ -n "$MATRIX_GLOB" ]; then
+          matched=()
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            # shellcheck disable=SC2053  # unquoted RHS is the glob match we want
+            [[ "$file" == $MATRIX_GLOB ]] || continue
+
+            dir="$(dirname "$file")"
+            if [ -n "$MATRIX_MARKER" ]; then
+              # Walk up until we find the marker; skip the file if no ancestor has one.
+              while [ "$dir" != "." ] && [ "$dir" != "/" ] && [ ! -f "$dir/$MATRIX_MARKER" ]; do
+                dir="$(dirname "$dir")"
+              done
+              [ -f "$dir/$MATRIX_MARKER" ] || continue
+            fi
+            # A deleted directory can't be built; only emit ones that still exist.
+            [ -d "$dir" ] || continue
+            matched+=("$dir")
+          done < /tmp/atk-changed.txt
+
+          if [ "${#matched[@]}" -gt 0 ]; then
+            directories="$(printf '%s\n' "${matched[@]}" | sort -u | jq -R . | jq -sc .)"
+            count="$(printf '%s\n' "${matched[@]}" | sort -u | wc -l | tr -d ' ')"
+          fi
+          echo "Matrix directories: $directories"
+        fi
+
+        {
+          echo "directories=$directories"
+          echo "count=$count"
+          echo "any_changed=$any_changed"
+          echo "base=$base"
+        } >> "$GITHUB_OUTPUT"
