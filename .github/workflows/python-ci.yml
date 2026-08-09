@@ -1,0 +1,311 @@
+# Python CI: ruff lint + format gate, optional mypy, pytest with coverage, and an optional
+# version matrix.
+#
+# uv-first, because in CI the install step is most of the wall clock and uv removes it.
+# ruff replaces flake8/isort/black with one tool, which is why lint and format are separate
+# commands against the same binary rather than three jobs.
+#
+# Usage:
+#   jobs:
+#     ci:
+#       uses: patrickisgreat/actions-toolkit/.github/workflows/python-ci.yml@v1
+#       with:
+#         python-versions: '["3.11","3.12","3.13"]'
+#         mypy: true
+#       secrets: inherit
+
+name: Python CI
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: Python version when not using a matrix.
+        type: string
+        required: false
+        default: '3.12'
+      python-versions:
+        description: |
+          JSON array of versions to test against, e.g. `["3.11","3.12"]`. Overrides
+          `python-version` and fans the test job out into a matrix.
+        type: string
+        required: false
+        default: ''
+      installer:
+        description: 'uv | pip'
+        type: string
+        required: false
+        default: 'uv'
+      groups:
+        description: Dependency groups/extras for `uv sync`.
+        type: string
+        required: false
+        default: '--all-extras --dev'
+      working-directory:
+        description: Directory containing the project.
+        type: string
+        required: false
+        default: '.'
+      runs-on:
+        description: Runner label.
+        type: string
+        required: false
+        default: 'ubuntu-latest'
+
+      lint:
+        description: 'true to run `ruff check`.'
+        type: boolean
+        required: false
+        default: true
+      lint-command:
+        description: Override the lint command.
+        type: string
+        required: false
+        default: 'ruff check .'
+      format:
+        description: 'true to run `ruff format --check`.'
+        type: boolean
+        required: false
+        default: true
+      format-command:
+        description: Override the format-check command.
+        type: string
+        required: false
+        default: 'ruff format --check --diff .'
+      mypy:
+        description: 'true to run mypy.'
+        type: boolean
+        required: false
+        default: false
+      mypy-command:
+        description: Override the type-check command.
+        type: string
+        required: false
+        default: 'mypy .'
+      test-command:
+        description: Test command. Empty skips tests.
+        type: string
+        required: false
+        default: 'pytest -q --cov --cov-report=xml --cov-report=term-missing'
+
+      coverage:
+        description: 'true to upload coverage to Codecov.'
+        type: boolean
+        required: false
+        default: true
+      coverage-file:
+        description: Coverage file to upload.
+        type: string
+        required: false
+        default: './coverage.xml'
+      coverage-threshold:
+        description: 'Minimum total coverage percentage. Empty disables the gate.'
+        type: string
+        required: false
+        default: ''
+
+      services-compose:
+        description: |
+          Path to a docker-compose file started before the tests — for suites that need a
+          real Postgres or Redis rather than a mock. Empty skips it.
+        type: string
+        required: false
+        default: ''
+      env-map:
+        description: 'Newline-separated `KEY=SECRET_NAME` mappings. Requires `secrets: inherit`.'
+        type: string
+        required: false
+        default: ''
+      public-env:
+        description: Newline-separated `KEY=value` pairs for non-secret config.
+        type: string
+        required: false
+        default: ''
+      timeout-minutes:
+        description: Per-job timeout.
+        type: number
+        required: false
+        default: 20
+
+    secrets:
+      CODECOV_TOKEN:
+        description: Codecov upload token.
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  # The matrix is computed rather than written inline so `python-versions` can be optional:
+  # an empty value collapses the matrix to the single `python-version`.
+  matrix:
+    name: Resolve matrix
+    runs-on: ${{ inputs.runs-on }}
+    outputs:
+      versions: ${{ steps.build.outputs.versions }}
+    steps:
+      - name: Build the version matrix
+        id: build
+        env:
+          VERSIONS: ${{ inputs.python-versions }}
+          SINGLE: ${{ inputs.python-version }}
+        run: |
+          set -euo pipefail
+          if [ -n "$VERSIONS" ]; then
+            if ! jq -e 'type == "array" and length > 0' >/dev/null 2>&1 <<< "$VERSIONS"; then
+              echo "::error::python-versions must be a non-empty JSON array, e.g. '[\"3.12\"]'."
+              exit 1
+            fi
+            versions="$(jq -c . <<< "$VERSIONS")"
+          else
+            versions="$(jq -nc --arg v "$SINGLE" '[$v]')"
+          fi
+          echo "versions=$versions" >> "$GITHUB_OUTPUT"
+          echo "Matrix: $versions"
+
+  lint:
+    name: Lint & format
+    if: ${{ inputs.lint || inputs.format || inputs.mypy }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Set up Python
+        uses: ./.toolkit/actions/setup-python
+        with:
+          python-version: ${{ inputs.python-version }}
+          installer: ${{ inputs.installer }}
+          groups: ${{ inputs.groups }}
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: Ruff check
+        if: ${{ inputs.lint }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          LINT_COMMAND: ${{ inputs.lint-command }}
+        run: |
+          set -euo pipefail
+          # `ruff check --output-format=github` turns findings into inline PR annotations.
+          bash -eo pipefail -c "$LINT_COMMAND --output-format=github" ||
+            bash -eo pipefail -c "$LINT_COMMAND"
+
+      - name: Ruff format check
+        if: ${{ inputs.format }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          FORMAT_COMMAND: ${{ inputs.format-command }}
+        run: |
+          set -euo pipefail
+          bash -eo pipefail -c "$FORMAT_COMMAND"
+
+      - name: mypy
+        if: ${{ inputs.mypy }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          MYPY_COMMAND: ${{ inputs.mypy-command }}
+        run: |
+          set -euo pipefail
+          bash -eo pipefail -c "$MYPY_COMMAND"
+
+  test:
+    name: Tests (py${{ matrix.python-version }})
+    needs: [matrix]
+    if: ${{ inputs.test-command != '' }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON(needs.matrix.outputs.versions) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Set up Python
+        uses: ./.toolkit/actions/setup-python
+        with:
+          python-version: ${{ matrix.python-version }}
+          installer: ${{ inputs.installer }}
+          groups: ${{ inputs.groups }}
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: Resolve environment
+        uses: ./.toolkit/actions/resolve-env
+        with:
+          mappings: ${{ inputs.env-map }}
+          literal-vars: ${{ inputs.public-env }}
+          secrets-json: ${{ toJSON(secrets) }}
+
+      - name: Start service containers
+        if: ${{ inputs.services-compose != '' }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          COMPOSE_FILE_PATH: ${{ inputs.services-compose }}
+        run: |
+          set -euo pipefail
+          docker compose -f "$COMPOSE_FILE_PATH" up -d --wait
+          docker compose -f "$COMPOSE_FILE_PATH" ps
+
+      - name: Run tests
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          TEST_COMMAND: ${{ inputs.test-command }}
+        run: |
+          set -euo pipefail
+          bash -eo pipefail -c "$TEST_COMMAND"
+
+      - name: Enforce the coverage threshold
+        if: ${{ inputs.coverage-threshold != '' }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          COVERAGE_FILE: ${{ inputs.coverage-file }}
+          THRESHOLD: ${{ inputs.coverage-threshold }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$COVERAGE_FILE" ]; then
+            echo "::error::coverage-threshold is set but '$COVERAGE_FILE' was not produced."
+            exit 1
+          fi
+          # coverage.py's Cobertura XML carries the total as a 0..1 `line-rate` attribute.
+          rate="$(grep -m1 -oE 'line-rate="[0-9.]+"' "$COVERAGE_FILE" | head -1 | grep -oE '[0-9.]+')"
+          percent="$(jq -nr --argjson r "$rate" '($r * 100) | . * 10 | round / 10')"
+          echo "Total coverage: ${percent}% (threshold ${THRESHOLD}%)"
+          echo "### Coverage: ${percent}% (threshold ${THRESHOLD}%)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$(jq -nr --argjson p "$percent" --argjson t "$THRESHOLD" '$p >= $t')" != "true" ]; then
+            echo "::error::Coverage ${percent}% is below the ${THRESHOLD}% threshold."
+            exit 1
+          fi
+
+      - name: Upload coverage to Codecov
+        if: ${{ inputs.coverage && always() }}
+        uses: codecov/codecov-action@v7
+        with:
+          files: ${{ inputs.coverage-file }}
+          flags: py${{ matrix.python-version }}
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Stop service containers
+        if: ${{ always() && inputs.services-compose != '' }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          COMPOSE_FILE_PATH: ${{ inputs.services-compose }}
+        run: |
+          set -euo pipefail
+          # Teardown must never fail the job — the tests already reported their verdict.
+          docker compose -f "$COMPOSE_FILE_PATH" down -v || true

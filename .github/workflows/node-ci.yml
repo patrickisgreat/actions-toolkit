@@ -1,0 +1,438 @@
+# Node/TypeScript CI: lint + format gate, unit tests with coverage, build, and an optional
+# Playwright e2e stage. Modelled on the pipeline running in threaditate.
+#
+# Usage:
+#   jobs:
+#     ci:
+#       uses: patrickisgreat/actions-toolkit/.github/workflows/node-ci.yml@v1
+#       with:
+#         node-version: '22'
+#         e2e: auto
+#         build-env: |
+#           NEXT_PUBLIC_SUPABASE_URL=NEXT_PUBLIC_SUPABASE_URL
+#           NEXT_PUBLIC_SUPABASE_ANON_KEY=NEXT_PUBLIC_SUPABASE_ANON_KEY
+#       secrets: inherit
+#
+# ── Three things worth knowing ────────────────────────────────────────────────────────
+#
+# 1. `.toolkit` checkout. A reusable workflow cannot `uses: ./actions/…` — inside a called
+#    workflow `./` is the *caller's* checkout. Each job therefore clones this repo at
+#    `github.job_workflow_sha`, the SHA of this very workflow file, so the actions always
+#    match the workflow version the caller pinned.
+#
+# 2. The format gate runs the formatter and fails if it changed anything, rather than
+#    running `--check`. Same signal, but the job log then names the offending files.
+#    Lockfiles are excluded: Dependabot installs regenerate them, which has nothing to do
+#    with whether code was formatted.
+#
+# 3. `build-env` maps your secret names onto the env var names your build expects, so this
+#    workflow never has to know either. It requires `secrets: inherit` — without it, the
+#    `secrets` context here holds only the two secrets declared below.
+
+name: Node CI
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node version.
+        type: string
+        required: false
+        default: '22'
+      package-manager:
+        description: 'auto | pnpm | npm | yarn | bun'
+        type: string
+        required: false
+        default: 'auto'
+      pnpm-version:
+        description: pnpm version. Empty reads `packageManager` from package.json.
+        type: string
+        required: false
+        default: ''
+      working-directory:
+        description: Directory containing the project.
+        type: string
+        required: false
+        default: '.'
+      runs-on:
+        description: Runner label.
+        type: string
+        required: false
+        default: 'ubuntu-latest'
+
+      lint-command:
+        description: Lint command, run via the package manager. Empty skips linting.
+        type: string
+        required: false
+        default: 'lint'
+      format-command:
+        description: |
+          Formatter command run in write mode; the job fails if it changed tracked files.
+          Empty skips the format gate.
+        type: string
+        required: false
+        default: 'format'
+      format-ignore:
+        description: Pathspecs excluded from the format diff check.
+        type: string
+        required: false
+        default: ':!pnpm-lock.yaml :!package-lock.json :!yarn.lock :!bun.lock :!bun.lockb'
+      typecheck-command:
+        description: Type-check command. Empty skips it.
+        type: string
+        required: false
+        default: ''
+      test-command:
+        description: Unit test command. Empty skips tests.
+        type: string
+        required: false
+        default: 'test:ci'
+      build-command:
+        description: Build command. Empty skips the build.
+        type: string
+        required: false
+        default: 'build'
+
+      coverage:
+        description: 'true to upload coverage to Codecov.'
+        type: boolean
+        required: false
+        default: true
+      coverage-file:
+        description: Coverage file to upload.
+        type: string
+        required: false
+        default: './coverage/lcov.info'
+
+      e2e:
+        description: |
+          Playwright stage: `none`, `smoke` (only @smoke-tagged specs), `full`, or `auto` —
+          smoke on pull requests, full on everything else.
+        type: string
+        required: false
+        default: 'none'
+      e2e-command:
+        description: 'Playwright command; `{grep}` is replaced by the tag filter.'
+        type: string
+        required: false
+        default: 'exec playwright test --project=chromium {grep}'
+      e2e-browsers:
+        description: Browsers installed for Playwright.
+        type: string
+        required: false
+        default: 'chromium'
+
+      build-env:
+        description: |
+          Newline-separated `KEY=SECRET_NAME` mappings. Each named secret is exported under
+          `KEY` (masked) for the build, test, and e2e steps. Requires `secrets: inherit`.
+        type: string
+        required: false
+        default: ''
+      public-env:
+        description: Newline-separated `KEY=value` pairs for genuinely non-secret config.
+        type: string
+        required: false
+        default: ''
+      required-env:
+        description: Comma-separated env var names that must resolve, or the job fails.
+        type: string
+        required: false
+        default: ''
+
+      timeout-minutes:
+        description: Per-job timeout.
+        type: number
+        required: false
+        default: 20
+      upload-build:
+        description: 'true to upload the build output as an artifact.'
+        type: boolean
+        required: false
+        default: false
+      build-output-path:
+        description: Path uploaded when `upload-build` is true.
+        type: string
+        required: false
+        default: 'dist'
+
+    secrets:
+      CODECOV_TOKEN:
+        description: Codecov upload token.
+        required: false
+
+    outputs:
+      package-manager:
+        description: The package manager that was detected.
+        value: ${{ jobs.lint.outputs.package-manager }}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint & format
+    if: inputs.lint-command != '' || inputs.format-command != '' || inputs.typecheck-command != ''
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    outputs:
+      package-manager: ${{ steps.setup.outputs.package-manager }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Set up Node
+        id: setup
+        uses: ./.toolkit/actions/setup-node
+        with:
+          node-version: ${{ inputs.node-version }}
+          package-manager: ${{ inputs.package-manager }}
+          pnpm-version: ${{ inputs.pnpm-version }}
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: Format
+        if: inputs.format-command != ''
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          MANAGER: ${{ steps.setup.outputs.package-manager }}
+          FORMAT_COMMAND: ${{ inputs.format-command }}
+          FORMAT_IGNORE: ${{ inputs.format-ignore }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          "$MANAGER" $FORMAT_COMMAND
+
+          # Running the formatter and diffing beats `--check`: the log names the files.
+          # shellcheck disable=SC2086
+          changed="$(git diff --name-only -- . $FORMAT_IGNORE)"
+          if [ -n "$changed" ]; then
+            echo "::error::Files are not formatted. Run '$MANAGER $FORMAT_COMMAND' locally and commit."
+            printf '%s\n' "$changed"
+            exit 1
+          fi
+          echo "Formatting is clean."
+
+      - name: Lint
+        if: inputs.lint-command != ''
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          MANAGER: ${{ steps.setup.outputs.package-manager }}
+          LINT_COMMAND: ${{ inputs.lint-command }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          "$MANAGER" $LINT_COMMAND
+
+      - name: Type-check
+        if: inputs.typecheck-command != ''
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          MANAGER: ${{ steps.setup.outputs.package-manager }}
+          TYPECHECK_COMMAND: ${{ inputs.typecheck-command }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          "$MANAGER" $TYPECHECK_COMMAND
+
+  test:
+    name: Unit tests
+    if: inputs.test-command != ''
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Set up Node
+        id: setup
+        uses: ./.toolkit/actions/setup-node
+        with:
+          node-version: ${{ inputs.node-version }}
+          package-manager: ${{ inputs.package-manager }}
+          pnpm-version: ${{ inputs.pnpm-version }}
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: Resolve environment
+        uses: ./.toolkit/actions/resolve-env
+        with:
+          mappings: ${{ inputs.build-env }}
+          literal-vars: ${{ inputs.public-env }}
+          secrets-json: ${{ toJSON(secrets) }}
+          required: ${{ inputs.required-env }}
+
+      - name: Run unit tests
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          MANAGER: ${{ steps.setup.outputs.package-manager }}
+          TEST_COMMAND: ${{ inputs.test-command }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          "$MANAGER" $TEST_COMMAND
+
+      - name: Upload coverage to Codecov
+        if: ${{ inputs.coverage && always() }}
+        uses: codecov/codecov-action@v7
+        with:
+          files: ${{ inputs.coverage-file }}
+          flags: unittests
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  build:
+    name: Build
+    needs: [lint, test]
+    # `always()` is required because `lint` and `test` are conditionally skipped when the
+    # caller has no such command — and a plain `needs` on a skipped job skips this one too.
+    # The explicit result check keeps a genuine failure upstream from letting the build run.
+    if: ${{ always() && inputs.build-command != '' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Set up Node
+        id: setup
+        uses: ./.toolkit/actions/setup-node
+        with:
+          node-version: ${{ inputs.node-version }}
+          package-manager: ${{ inputs.package-manager }}
+          pnpm-version: ${{ inputs.pnpm-version }}
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: Resolve environment
+        uses: ./.toolkit/actions/resolve-env
+        with:
+          mappings: ${{ inputs.build-env }}
+          literal-vars: ${{ inputs.public-env }}
+          secrets-json: ${{ toJSON(secrets) }}
+          required: ${{ inputs.required-env }}
+
+      - name: Build
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          MANAGER: ${{ steps.setup.outputs.package-manager }}
+          BUILD_COMMAND: ${{ inputs.build-command }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          "$MANAGER" $BUILD_COMMAND
+
+      - name: Upload build output
+        if: ${{ inputs.upload-build }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-output
+          path: ${{ inputs.working-directory }}/${{ inputs.build-output-path }}
+          retention-days: 7
+
+  e2e:
+    name: E2E
+    needs: [lint, test]
+    if: ${{ always() && inputs.e2e != 'none' && inputs.e2e != '' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Decide the test scope
+        id: scope
+        env:
+          E2E_MODE: ${{ inputs.e2e }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          mode="$E2E_MODE"
+          if [ "$mode" = "auto" ]; then
+            # Smoke on PRs keeps feedback fast; full on main and the nightly cron catches
+            # drift in external dependencies that a smoke run would miss.
+            case "$EVENT_NAME" in
+              pull_request|pull_request_target) mode=smoke ;;
+              *) mode=full ;;
+            esac
+            echo "Resolved e2e=auto to '$mode' for event '$EVENT_NAME'."
+          fi
+          case "$mode" in
+            smoke) grep_flag='--grep @smoke' ;;
+            full)  grep_flag='' ;;
+            *) echo "::error::e2e='$mode' is not supported (none|smoke|full|auto)."; exit 1 ;;
+          esac
+          {
+            echo "mode=$mode"
+            echo "grep=$grep_flag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node
+        id: setup
+        uses: ./.toolkit/actions/setup-node
+        with:
+          node-version: ${{ inputs.node-version }}
+          package-manager: ${{ inputs.package-manager }}
+          pnpm-version: ${{ inputs.pnpm-version }}
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: Resolve environment
+        uses: ./.toolkit/actions/resolve-env
+        with:
+          mappings: ${{ inputs.build-env }}
+          literal-vars: ${{ inputs.public-env }}
+          secrets-json: ${{ toJSON(secrets) }}
+          required: ${{ inputs.required-env }}
+
+      - name: Install Playwright browsers
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          MANAGER: ${{ steps.setup.outputs.package-manager }}
+          BROWSERS: ${{ inputs.e2e-browsers }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          "$MANAGER" exec playwright install --with-deps $BROWSERS
+
+      - name: Run Playwright
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          MANAGER: ${{ steps.setup.outputs.package-manager }}
+          E2E_COMMAND: ${{ inputs.e2e-command }}
+          GREP: ${{ steps.scope.outputs.grep }}
+        run: |
+          set -euo pipefail
+          command="${E2E_COMMAND//\{grep\}/$GREP}"
+          echo "Running: $MANAGER $command"
+          # shellcheck disable=SC2086
+          "$MANAGER" $command
+
+      - name: Upload the Playwright report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report-${{ steps.scope.outputs.mode }}
+          path: ${{ inputs.working-directory }}/playwright-report/
+          retention-days: 7

@@ -1,0 +1,243 @@
+# Security scanning: filesystem vulnerabilities, IaC misconfiguration, leaked secrets,
+# and dependency review on PRs.
+#
+# Findings go to the GitHub Security tab via SARIF where possible, rather than only to the
+# job log. A finding in a log scrolls away after one push; a finding in the Security tab
+# stays until someone resolves or dismisses it, and dismissals are recorded.
+#
+# `fail-on-severity` defaults to reporting rather than blocking. Turning a security scan
+# into a hard gate on day one, on a repo that has never been scanned, produces a red build
+# nobody can fix that afternoon — and the reliable outcome of that is the scan getting
+# disabled. Report first, triage the backlog, then tighten.
+#
+# Usage:
+#   jobs:
+#     security:
+#       uses: patrickisgreat/actions-toolkit/.github/workflows/security-scan.yml@v1
+#       permissions:
+#         contents: read
+#         security-events: write
+#         pull-requests: read
+
+name: Security scan
+
+on:
+  workflow_call:
+    inputs:
+      filesystem-scan:
+        description: 'true to scan dependencies and the filesystem for known CVEs.'
+        type: boolean
+        required: false
+        default: true
+      config-scan:
+        description: 'true to scan IaC (Terraform, Dockerfile, Kubernetes) for misconfiguration.'
+        type: boolean
+        required: false
+        default: true
+      secret-scan:
+        description: 'true to scan history for leaked credentials with gitleaks.'
+        type: boolean
+        required: false
+        default: true
+      dependency-review:
+        description: 'true to run GitHub dependency review on pull requests.'
+        type: boolean
+        required: false
+        default: true
+      image:
+        description: Container image reference to scan. Empty skips the image scan.
+        type: string
+        required: false
+        default: ''
+
+      severity:
+        description: Severities reported.
+        type: string
+        required: false
+        default: 'CRITICAL,HIGH'
+      fail-on-severity:
+        description: |
+          Severities that fail the build. Empty (default) reports without blocking.
+          Set to `CRITICAL` once the backlog is triaged.
+        type: string
+        required: false
+        default: ''
+      ignore-unfixed:
+        description: 'true to hide vulnerabilities with no available fix.'
+        type: boolean
+        required: false
+        default: true
+      trivyignore:
+        description: Path to a `.trivyignore` file.
+        type: string
+        required: false
+        default: '.trivyignore'
+      upload-sarif:
+        description: |
+          'true to upload SARIF to the Security tab. Needs `security-events: write`;
+          silently unavailable on private repos without GitHub Advanced Security.'
+        type: boolean
+        required: false
+        default: true
+      runs-on:
+        description: Runner label.
+        type: string
+        required: false
+        default: 'ubuntu-latest'
+      timeout-minutes:
+        description: Per-job timeout.
+        type: number
+        required: false
+        default: 20
+
+    secrets:
+      GITLEAKS_LICENSE:
+        description: gitleaks-action licence key, required for organization repos.
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  vulnerabilities:
+    name: Dependency & filesystem CVEs
+    if: ${{ inputs.filesystem-scan }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
+          severity: ${{ inputs.severity }}
+          ignore-unfixed: ${{ inputs.ignore-unfixed }}
+          trivyignores: ${{ inputs.trivyignore }}
+          format: sarif
+          output: trivy-fs.sarif
+          # Never fail here: the SARIF upload below has to run for the findings to be
+          # visible at all, and a failed step would skip it.
+          exit-code: '0'
+
+      - name: Upload SARIF
+        if: ${{ inputs.upload-sarif && always() && hashFiles('trivy-fs.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+        continue-on-error: true
+
+      - name: Enforce the severity gate
+        if: ${{ inputs.fail-on-severity != '' }}
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: ${{ inputs.fail-on-severity }}
+          ignore-unfixed: ${{ inputs.ignore-unfixed }}
+          trivyignores: ${{ inputs.trivyignore }}
+          format: table
+          exit-code: '1'
+
+  config:
+    name: IaC misconfiguration
+    if: ${{ inputs.config-scan }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Trivy config scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          severity: ${{ inputs.severity }}
+          trivyignores: ${{ inputs.trivyignore }}
+          format: sarif
+          output: trivy-config.sarif
+          exit-code: '0'
+
+      - name: Upload SARIF
+        if: ${{ inputs.upload-sarif && always() && hashFiles('trivy-config.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-config.sarif
+          category: trivy-config
+        continue-on-error: true
+
+  image:
+    name: Container image CVEs
+    if: ${{ inputs.image != '' }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ inputs.image }}
+          severity: ${{ inputs.severity }}
+          ignore-unfixed: ${{ inputs.ignore-unfixed }}
+          format: sarif
+          output: trivy-image.sarif
+          exit-code: '0'
+
+      - name: Upload SARIF
+        if: ${{ inputs.upload-sarif && always() && hashFiles('trivy-image.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+        continue-on-error: true
+
+  secrets:
+    name: Leaked secrets
+    if: ${{ inputs.secret-scan }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # gitleaks scans history, not just the working tree — a credential that was
+          # committed and then removed is still a leaked credential.
+          fetch-depth: 0
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  dependencies:
+    name: Dependency review
+    if: ${{ inputs.dependency-review && github.event_name == 'pull_request' }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@v5
+        with:
+          fail-on-severity: ${{ inputs.fail-on-severity != '' && 'high' || 'critical' }}
+          warn-only: ${{ inputs.fail-on-severity == '' }}
+          comment-summary-in-pr: on-failure

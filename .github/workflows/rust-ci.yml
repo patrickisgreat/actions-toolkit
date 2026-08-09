@@ -1,0 +1,220 @@
+# Rust CI: rustfmt gate, clippy with warnings denied, tests, and an optional MSRV check.
+#
+# `clippy -D warnings` is the default because clippy's value collapses if warnings are
+# advisory — they accumulate until nobody reads them. If that's too strict for an existing
+# codebase, set `clippy-args` to something narrower rather than turning clippy off.
+#
+# The MSRV job exists because "it compiles on stable" and "it compiles on the version in
+# your Cargo.toml `rust-version`" are different claims, and only the second one is a
+# promise to your users.
+
+name: Rust CI
+
+on:
+  workflow_call:
+    inputs:
+      toolchain:
+        description: 'Primary toolchain: `stable`, `nightly`, or a pinned version.'
+        type: string
+        required: false
+        default: 'stable'
+      msrv:
+        description: 'Minimum supported Rust version to also build against. Empty skips it.'
+        type: string
+        required: false
+        default: ''
+      working-directory:
+        description: Directory containing Cargo.toml.
+        type: string
+        required: false
+        default: '.'
+      runs-on:
+        description: Runner label.
+        type: string
+        required: false
+        default: 'ubuntu-latest'
+
+      fmt:
+        description: 'true to run `cargo fmt --check`.'
+        type: boolean
+        required: false
+        default: true
+      clippy:
+        description: 'true to run clippy.'
+        type: boolean
+        required: false
+        default: true
+      clippy-args:
+        description: Arguments passed to clippy.
+        type: string
+        required: false
+        default: '--all-targets --all-features -- -D warnings'
+      test-command:
+        description: Test command. Empty skips tests.
+        type: string
+        required: false
+        default: 'cargo test --all-features'
+      doc-test:
+        description: 'true to also run doc tests.'
+        type: boolean
+        required: false
+        default: false
+      build-command:
+        description: Release build command. Empty skips the build job.
+        type: string
+        required: false
+        default: ''
+      targets:
+        description: Comma-separated cross-compilation targets to install.
+        type: string
+        required: false
+        default: ''
+      timeout-minutes:
+        description: Per-job timeout.
+        type: number
+        required: false
+        default: 30
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: fmt & clippy
+    if: ${{ inputs.fmt || inputs.clippy }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Set up Rust
+        uses: ./.toolkit/actions/setup-rust
+        with:
+          toolchain: ${{ inputs.toolchain }}
+          components: clippy,rustfmt
+          targets: ${{ inputs.targets }}
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: cargo fmt
+        if: ${{ inputs.fmt }}
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+
+      - name: cargo clippy
+        if: ${{ inputs.clippy }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          CLIPPY_ARGS: ${{ inputs.clippy-args }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          cargo clippy $CLIPPY_ARGS
+
+  test:
+    name: Tests
+    if: ${{ inputs.test-command != '' }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Set up Rust
+        uses: ./.toolkit/actions/setup-rust
+        with:
+          toolchain: ${{ inputs.toolchain }}
+          targets: ${{ inputs.targets }}
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: Run tests
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          TEST_COMMAND: ${{ inputs.test-command }}
+        run: |
+          set -euo pipefail
+          bash -eo pipefail -c "$TEST_COMMAND"
+
+      - name: Run doc tests
+        if: ${{ inputs.doc-test }}
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          cargo test --doc --all-features
+
+  msrv:
+    name: MSRV (${{ inputs.msrv }})
+    if: ${{ inputs.msrv != '' }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Set up Rust
+        uses: ./.toolkit/actions/setup-rust
+        with:
+          toolchain: ${{ inputs.msrv }}
+          components: ''
+          # A separate cache key: MSRV artifacts are not interchangeable with stable ones,
+          # and sharing the key makes both jobs miss.
+          cache-key: msrv
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: cargo check
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          # `check`, not `test`: the MSRV promise is that it compiles, and running the full
+          # suite twice buys little for the runtime it costs.
+          cargo check --all-features --all-targets
+
+  build:
+    name: Release build
+    if: ${{ inputs.build-command != '' }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Set up Rust
+        uses: ./.toolkit/actions/setup-rust
+        with:
+          toolchain: ${{ inputs.toolchain }}
+          targets: ${{ inputs.targets }}
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: Build
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          BUILD_COMMAND: ${{ inputs.build-command }}
+        run: |
+          set -euo pipefail
+          bash -eo pipefail -c "$BUILD_COMMAND"
