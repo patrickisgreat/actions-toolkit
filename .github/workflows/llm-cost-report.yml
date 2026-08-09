@@ -1,0 +1,269 @@
+# Where the money went: LLM spend plus GitHub Actions runner spend, over a window.
+#
+# The two costs of an AI-assisted repo pull in opposite directions and are usually tracked
+# in different places (or not at all). This puts both in one scheduled report so the
+# trade-off is visible — an agent workflow that halves review time but triples runner
+# minutes is a decision, not an accident.
+#
+#   • LLM spend comes from the OpenRouter generation API when `OPENROUTER_API_KEY` is set.
+#     It is real charged cost, not an estimate.
+#   • Runner spend is computed from the Actions API: billable minutes per workflow times
+#     the per-minute rate for the runner OS.
+#
+# Runs on a schedule (monthly is the useful cadence) or on demand. Output goes to the job
+# summary and, optionally, a tracking issue that gets updated in place so the history reads
+# as a single thread.
+#
+# Usage:
+#   on:
+#     schedule: [{ cron: '0 9 1 * *' }]
+#     workflow_dispatch:
+#   jobs:
+#     cost:
+#       uses: patrickisgreat/actions-toolkit/.github/workflows/llm-cost-report.yml@v1
+#       with: { days: 30, issue-number: '12' }
+#       secrets: inherit
+
+name: LLM cost report
+
+on:
+  workflow_call:
+    inputs:
+      days:
+        description: Window in days.
+        type: number
+        required: false
+        default: 30
+      issue-number:
+        description: Issue to post the report to as a sticky comment. Empty posts nowhere.
+        type: string
+        required: false
+        default: ''
+      include-actions-cost:
+        description: 'true to include GitHub Actions runner spend.'
+        type: boolean
+        required: false
+        default: true
+      include-llm-cost:
+        description: 'true to include OpenRouter spend (needs `OPENROUTER_API_KEY`).'
+        type: boolean
+        required: false
+        default: true
+      linux-rate:
+        description: USD per minute for a Linux runner.
+        type: string
+        required: false
+        default: '0.008'
+      windows-rate:
+        description: USD per minute for a Windows runner.
+        type: string
+        required: false
+        default: '0.016'
+      macos-rate:
+        description: USD per minute for a macOS runner.
+        type: string
+        required: false
+        default: '0.08'
+      notify:
+        description: 'true to send a Slack/Discord summary.'
+        type: boolean
+        required: false
+        default: false
+      runs-on:
+        description: Runner label.
+        type: string
+        required: false
+        default: 'ubuntu-latest'
+
+    secrets:
+      OPENROUTER_API_KEY:
+        description: OpenRouter key, read-scoped is enough.
+        required: false
+      SLACK_WEBHOOK:
+        required: false
+      DISCORD_WEBHOOK:
+        required: false
+
+    outputs:
+      total-usd:
+        description: Combined estimated spend over the window.
+        value: ${{ jobs.report.outputs.total }}
+
+permissions:
+  contents: read
+
+jobs:
+  report:
+    name: Cost report
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    outputs:
+      total: ${{ steps.build.outputs.total }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Build the report
+        id: build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DAYS: ${{ inputs.days }}
+          INCLUDE_ACTIONS: ${{ inputs.include-actions-cost }}
+          INCLUDE_LLM: ${{ inputs.include-llm-cost }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          LINUX_RATE: ${{ inputs.linux-rate }}
+          WINDOWS_RATE: ${{ inputs.windows-rate }}
+          MACOS_RATE: ${{ inputs.macos-rate }}
+        run: |
+          # Single-quoted printf format strings and jq programs are deliberate here:
+          # values are passed as arguments, not expanded by the shell. (SC2016 is
+          # excluded repo-wide via SHELLCHECK_OPTS — see the Makefile.)
+          set -euo pipefail
+
+          since="$(date -u -d "${DAYS} days ago" +%Y-%m-%dT%H:%M:%SZ)"
+          echo "Window: $since → now"
+
+          actions_total=0
+          llm_total=0
+          report=/tmp/atk-cost-report.md
+          : > "$report"
+
+          {
+            printf '### 💸 Cost report — last %s days\n\n' "$DAYS"
+            printf '_Window: `%s` → now._\n\n' "$since"
+          } >> "$report"
+
+          # ── GitHub Actions ───────────────────────────────────────────────────
+          if [ "$INCLUDE_ACTIONS" = "true" ]; then
+            echo "Collecting workflow runs…"
+            # `created:>=` filters server-side; without it a busy repo pages forever.
+            gh api --paginate \
+              "repos/${REPO}/actions/runs?created=>=${since}&per_page=100" \
+              --jq '.workflow_runs[] | {id, name, conclusion}' > /tmp/atk-runs.jsonl || true
+
+            run_count="$(wc -l < /tmp/atk-runs.jsonl | tr -d ' ')"
+            echo "Found $run_count runs."
+
+            # Billable minutes are only available per-run, so this is one API call each.
+            # Cap it: a very busy month would otherwise blow the job's time budget for a
+            # number that is already an estimate.
+            : > /tmp/atk-usage.jsonl
+            head -n 500 /tmp/atk-runs.jsonl | while IFS= read -r run; do
+              [ -n "$run" ] || continue
+              id="$(jq -r '.id' <<< "$run")"
+              name="$(jq -r '.name' <<< "$run")"
+              usage="$(gh api "repos/${REPO}/actions/runs/${id}/timing" 2>/dev/null || echo '{}')"
+              jq -nc --arg name "$name" --argjson usage "$usage" '
+                { name: $name,
+                  ubuntu:  (($usage.billable.UBUNTU.total_ms  // 0) / 60000),
+                  windows: (($usage.billable.WINDOWS.total_ms // 0) / 60000),
+                  macos:   (($usage.billable.MACOS.total_ms   // 0) / 60000) }' \
+                >> /tmp/atk-usage.jsonl
+            done
+
+            if [ "$run_count" -gt 500 ]; then
+              echo "::warning::$run_count runs in the window; only the 500 most recent were priced."
+              printf '> ⚠️ Only the 500 most recent of %s runs were priced.\n\n' "$run_count" >> "$report"
+            fi
+
+            actions_json="$(jq -s \
+              --argjson lr "$LINUX_RATE" --argjson wr "$WINDOWS_RATE" --argjson mr "$MACOS_RATE" '
+              group_by(.name)
+              | map({
+                  name: .[0].name,
+                  runs: length,
+                  minutes: (map(.ubuntu + .windows + .macos) | add | . * 10 | round / 10),
+                  cost: ((map((.ubuntu * $lr) + (.windows * $wr) + (.macos * $mr)) | add)
+                         | . * 100 | round / 100)
+                })
+              | sort_by(-.cost)' /tmp/atk-usage.jsonl)"
+
+            actions_total="$(jq -r '[.[].cost] | add // 0 | . * 100 | round / 100' <<< "$actions_json")"
+
+            {
+              printf '#### GitHub Actions — $%s\n\n' "$actions_total"
+              printf '| Workflow | Runs | Minutes | Cost |\n|---|---:|---:|---:|\n'
+              jq -r '.[] | "| \(.name) | \(.runs) | \(.minutes) | $\(.cost) |"' <<< "$actions_json"
+              printf '\n'
+            } >> "$report"
+          fi
+
+          # ── OpenRouter ───────────────────────────────────────────────────────
+          if [ "$INCLUDE_LLM" = "true" ]; then
+            if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+              echo "::notice::OPENROUTER_API_KEY is not set — skipping LLM spend."
+              printf '#### LLM spend\n\n_No `OPENROUTER_API_KEY` configured._\n\n' >> "$report"
+            else
+              echo "Querying OpenRouter…"
+              # /credits reports lifetime totals; the delta over a window isn't exposed,
+              # so this is reported as a running total rather than a windowed figure.
+              credits="$(curl -sS --max-time 30 \
+                -H "Authorization: Bearer ${OPENROUTER_API_KEY}" \
+                https://openrouter.ai/api/v1/credits 2>/dev/null || echo '{}')"
+
+              used="$(jq -r '.data.total_usage // empty' <<< "$credits")"
+              granted="$(jq -r '.data.total_credits // empty' <<< "$credits")"
+
+              if [ -n "$used" ]; then
+                llm_total="$(jq -nr --argjson u "$used" '$u | . * 100 | round / 100')"
+                remaining="$(jq -nr --argjson g "${granted:-0}" --argjson u "$used" '($g - $u) | . * 100 | round / 100')"
+                {
+                  printf '#### OpenRouter — $%s used to date\n\n' "$llm_total"
+                  printf '| | |\n|---|---:|\n'
+                  printf '| Total usage | $%s |\n' "$llm_total"
+                  printf '| Credits remaining | $%s |\n\n' "$remaining"
+                  printf '_OpenRouter reports lifetime totals, not per-window spend._\n\n'
+                } >> "$report"
+              else
+                echo "::warning::Could not read OpenRouter credits — check the key."
+                printf '#### LLM spend\n\n_Could not read OpenRouter credits._\n\n' >> "$report"
+              fi
+            fi
+          fi
+
+          total="$(jq -nr --argjson a "${actions_total:-0}" --argjson l "${llm_total:-0}" \
+            '($a + $l) | . * 100 | round / 100')"
+
+          printf -- '---\n\n**Estimated total: $%s** (Actions $%s + LLM $%s)\n' \
+            "$total" "${actions_total:-0}" "${llm_total:-0}" >> "$report"
+
+          cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "total=$total"
+            echo "actions_total=${actions_total:-0}"
+            echo "llm_total=${llm_total:-0}"
+            echo "report_file=$report"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post to the tracking issue
+        if: ${{ inputs.issue-number != '' }}
+        uses: ./.toolkit/actions/pr-comment
+        with:
+          marker: llm-cost-report
+          issue-number: ${{ inputs.issue-number }}
+          body-file: ${{ steps.build.outputs.report_file }}
+          # `recreate` rather than `upsert`: a monthly report should ping the thread, not
+          # silently edit last month's numbers out of existence.
+          mode: recreate
+
+      - name: Notify
+        if: ${{ inputs.notify }}
+        uses: ./.toolkit/actions/notify
+        with:
+          status: info
+          title: Cost report — last ${{ inputs.days }} days
+          slack-webhook: ${{ secrets.SLACK_WEBHOOK }}
+          discord-webhook: ${{ secrets.DISCORD_WEBHOOK }}
+          fields: |
+            {"Total":"$${{ steps.build.outputs.total }}","Actions":"$${{ steps.build.outputs.actions_total }}","LLM":"$${{ steps.build.outputs.llm_total }}"}

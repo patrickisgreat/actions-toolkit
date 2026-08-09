@@ -1,0 +1,399 @@
+# Train → evaluate → register. A reproducible ML pipeline where the artifact that ships is
+# tied to the commit and data that produced it.
+#
+# The shape:
+#   1. Pull the dataset from durable storage (S3/GCS/HF) — never from an ad-hoc URL, so the
+#      inputs are as pinned as the code.
+#   2. Run training. Optionally restore a previous checkpoint so long runs can resume.
+#   3. Run evaluation and read a metric out of the results JSON.
+#   4. Register the model — but only if the metric cleared the gate. A model that got worse
+#      does not get published, which is the whole point of putting this in CI.
+#
+# Step 4's gate is what separates this from a shell script. The registered artifact carries
+# a manifest with per-file checksums and the producing commit, so "which code and data made
+# the weights currently in prod?" has an answer.
+#
+# GPU runs: point `runs-on` at a self-hosted or larger runner label. Nothing here assumes
+# a specific accelerator.
+
+name: ML pipeline
+
+on:
+  workflow_call:
+    inputs:
+      dataset-uri:
+        description: 'Dataset to pull, e.g. `s3://bucket/datasets/v3` or `hf://org/dataset`.'
+        type: string
+        required: false
+        default: ''
+      dataset-path:
+        description: Local path the dataset is downloaded to.
+        type: string
+        required: false
+        default: 'data'
+      checkpoint-uri:
+        description: Checkpoint to resume from. Empty trains from scratch.
+        type: string
+        required: false
+        default: ''
+      checkpoint-path:
+        description: Local path for the restored checkpoint.
+        type: string
+        required: false
+        default: 'checkpoints'
+
+      train-command:
+        description: Training command. Empty skips training (eval-only runs).
+        type: string
+        required: false
+        default: ''
+      eval-command:
+        description: Evaluation command. Must write `metrics-file`.
+        type: string
+        required: false
+        default: ''
+      metrics-file:
+        description: JSON file the eval writes its metrics to.
+        type: string
+        required: false
+        default: 'metrics.json'
+      metric-jq:
+        description: 'jq expression selecting the gating metric, e.g. `.accuracy`.'
+        type: string
+        required: false
+        default: '.accuracy'
+      metric-threshold:
+        description: Minimum metric value required to register. Empty disables the gate.
+        type: string
+        required: false
+        default: ''
+      metric-direction:
+        description: '`higher` (accuracy, F1) or `lower` (loss, WER, perplexity).'
+        type: string
+        required: false
+        default: 'higher'
+
+      model-path:
+        description: Local directory holding the trained model to register.
+        type: string
+        required: false
+        default: 'model'
+      registry-uri:
+        description: |
+          Where the model is published on success, e.g. `s3://bucket/models/my-model` or
+          `hf://org/my-model`. Empty skips registration.
+        type: string
+        required: false
+        default: ''
+      hf-repo-type:
+        description: '`model` | `dataset` | `space`, for a Hugging Face registry URI.'
+        type: string
+        required: false
+        default: 'model'
+
+      python-version:
+        description: Python version.
+        type: string
+        required: false
+        default: '3.12'
+      installer:
+        description: 'uv | pip'
+        type: string
+        required: false
+        default: 'uv'
+      groups:
+        description: Dependency groups/extras.
+        type: string
+        required: false
+        default: '--all-extras --dev'
+      working-directory:
+        description: Directory to run in.
+        type: string
+        required: false
+        default: '.'
+
+      aws-region:
+        description: AWS region, when the URIs are `s3://`.
+        type: string
+        required: false
+        default: ''
+      aws-role-to-assume:
+        description: OIDC role ARN for S3 access.
+        type: string
+        required: false
+        default: ''
+      gcp-workload-identity-provider:
+        description: WIF provider, when the URIs are `gs://`.
+        type: string
+        required: false
+        default: ''
+      gcp-service-account:
+        description: Service account to impersonate for GCS.
+        type: string
+        required: false
+        default: ''
+
+      env-map:
+        description: Newline-separated `KEY=SECRET_NAME` mappings for training/eval.
+        type: string
+        required: false
+        default: ''
+      public-env:
+        description: 'Newline-separated `KEY=value` non-secret config (hyperparameters).'
+        type: string
+        required: false
+        default: ''
+      comment-on-pr:
+        description: 'true to post the metrics as a sticky PR comment.'
+        type: boolean
+        required: false
+        default: true
+      runs-on:
+        description: 'Runner label. Point this at a GPU runner for real training.'
+        type: string
+        required: false
+        default: 'ubuntu-latest'
+      timeout-minutes:
+        description: Job timeout.
+        type: number
+        required: false
+        default: 360
+
+    secrets:
+      HF_TOKEN:
+        description: Hugging Face token, for `hf://` URIs.
+        required: false
+      SLACK_WEBHOOK:
+        required: false
+      DISCORD_WEBHOOK:
+        required: false
+
+    outputs:
+      metric:
+        description: The gating metric value that was measured.
+        value: ${{ jobs.pipeline.outputs.metric }}
+      registered:
+        description: '`true` if the model cleared the gate and was published.'
+        value: ${{ jobs.pipeline.outputs.registered }}
+
+permissions:
+  contents: read
+
+jobs:
+  pipeline:
+    name: Train & evaluate
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    outputs:
+      metric: ${{ steps.gate.outputs.metric }}
+      registered: ${{ steps.gate.outputs.passed }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Authenticate to AWS
+        if: ${{ inputs.aws-role-to-assume != '' }}
+        uses: ./.toolkit/actions/aws-auth
+        with:
+          aws-region: ${{ inputs.aws-region }}
+          role-to-assume: ${{ inputs.aws-role-to-assume }}
+
+      - name: Authenticate to GCP
+        if: ${{ inputs.gcp-workload-identity-provider != '' }}
+        uses: ./.toolkit/actions/gcp-auth
+        with:
+          workload-identity-provider: ${{ inputs.gcp-workload-identity-provider }}
+          service-account: ${{ inputs.gcp-service-account }}
+
+      - name: Set up Python
+        uses: ./.toolkit/actions/setup-python
+        with:
+          python-version: ${{ inputs.python-version }}
+          installer: ${{ inputs.installer }}
+          groups: ${{ inputs.groups }}
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: Resolve environment
+        uses: ./.toolkit/actions/resolve-env
+        with:
+          mappings: ${{ inputs.env-map }}
+          literal-vars: ${{ inputs.public-env }}
+          secrets-json: ${{ toJSON(secrets) }}
+
+      - name: Pull the dataset
+        if: ${{ inputs.dataset-uri != '' }}
+        uses: ./.toolkit/actions/ml-artifact
+        with:
+          operation: download
+          local-path: ${{ inputs.working-directory }}/${{ inputs.dataset-path }}
+          remote-uri: ${{ inputs.dataset-uri }}
+          hf-token: ${{ secrets.HF_TOKEN }}
+          hf-repo-type: dataset
+
+      - name: Restore the checkpoint
+        if: ${{ inputs.checkpoint-uri != '' }}
+        uses: ./.toolkit/actions/ml-artifact
+        with:
+          operation: download
+          local-path: ${{ inputs.working-directory }}/${{ inputs.checkpoint-path }}
+          remote-uri: ${{ inputs.checkpoint-uri }}
+          hf-token: ${{ secrets.HF_TOKEN }}
+          # A missing checkpoint means "start from scratch", not "fail the run".
+          fail-if-missing: 'false'
+
+      - name: Train
+        if: ${{ inputs.train-command != '' }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          TRAIN_COMMAND: ${{ inputs.train-command }}
+          DATASET_PATH: ${{ inputs.dataset-path }}
+          CHECKPOINT_PATH: ${{ inputs.checkpoint-path }}
+          MODEL_PATH: ${{ inputs.model-path }}
+        run: |
+          set -euo pipefail
+          # Paths are exported so the training script takes them from the environment
+          # rather than having them baked into the command string.
+          bash -eo pipefail -c "$TRAIN_COMMAND"
+
+      - name: Evaluate
+        if: ${{ inputs.eval-command != '' }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          EVAL_COMMAND: ${{ inputs.eval-command }}
+          DATASET_PATH: ${{ inputs.dataset-path }}
+          MODEL_PATH: ${{ inputs.model-path }}
+          METRICS_FILE: ${{ inputs.metrics-file }}
+        run: |
+          set -euo pipefail
+          bash -eo pipefail -c "$EVAL_COMMAND"
+
+      - name: Check the metric gate
+        id: gate
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          METRICS_FILE: ${{ inputs.metrics-file }}
+          METRIC_JQ: ${{ inputs.metric-jq }}
+          THRESHOLD: ${{ inputs.metric-threshold }}
+          DIRECTION: ${{ inputs.metric-direction }}
+          EVAL_COMMAND: ${{ inputs.eval-command }}
+        run: |
+          # Single-quoted printf format strings and jq programs are deliberate here:
+          # values are passed as arguments, not expanded by the shell. (SC2016 is
+          # excluded repo-wide via SHELLCHECK_OPTS — see the Makefile.)
+          set -euo pipefail
+
+          if [ -z "$EVAL_COMMAND" ]; then
+            echo "::notice::No eval command — skipping the metric gate."
+            { echo "metric="; echo "passed=true"; echo "summary=no evaluation run"; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ ! -f "$METRICS_FILE" ]; then
+            echo "::error::Evaluation did not produce '$METRICS_FILE'."
+            exit 1
+          fi
+          echo "Metrics:"
+          jq . "$METRICS_FILE"
+
+          metric="$(jq -r "$METRIC_JQ // empty" "$METRICS_FILE")"
+          if [ -z "$metric" ] || [ "$metric" = "null" ]; then
+            echo "::error::'$METRIC_JQ' did not select a value from $METRICS_FILE."
+            exit 1
+          fi
+
+          passed=true
+          summary="metric=$metric"
+          if [ -n "$THRESHOLD" ]; then
+            case "$DIRECTION" in
+              higher) expr='$m >= $t'; word='at least' ;;
+              lower)  expr='$m <= $t'; word='at most' ;;
+              *) echo "::error::metric-direction='$DIRECTION' is not supported (higher|lower)."; exit 1 ;;
+            esac
+            if [ "$(jq -nr --argjson m "$metric" --argjson t "$THRESHOLD" "$expr")" != "true" ]; then
+              passed=false
+              summary="metric $metric did not meet the required $word $THRESHOLD"
+              echo "::warning::$summary — the model will NOT be registered."
+            else
+              summary="metric $metric meets the required $word $THRESHOLD"
+              echo "$summary"
+            fi
+          fi
+
+          {
+            echo "metric=$metric"
+            echo "passed=$passed"
+            echo "summary=$summary"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### 🧠 ML pipeline"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Metric (\`$METRIC_JQ\`) | \`$metric\` |"
+            echo "| Threshold | \`${THRESHOLD:-none}\` (${DIRECTION}) |"
+            echo "| Gate | ${passed} |"
+            echo
+            echo '```json'
+            jq . "$METRICS_FILE"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Register the model
+        if: ${{ inputs.registry-uri != '' && steps.gate.outputs.passed == 'true' }}
+        uses: ./.toolkit/actions/ml-artifact
+        with:
+          operation: upload
+          local-path: ${{ inputs.working-directory }}/${{ inputs.model-path }}
+          remote-uri: ${{ inputs.registry-uri }}
+          hf-token: ${{ secrets.HF_TOKEN }}
+          hf-repo-type: ${{ inputs.hf-repo-type }}
+          manifest: 'true'
+          commit-message: >-
+            ${{ github.repository }}@${{ github.sha }} —
+            ${{ inputs.metric-jq }}=${{ steps.gate.outputs.metric }}
+
+      - name: Upload the metrics
+        if: ${{ always() && inputs.eval-command != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ml-metrics-${{ github.run_id }}
+          path: ${{ inputs.working-directory }}/${{ inputs.metrics-file }}
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Comment the metrics
+        if: ${{ always() && inputs.comment-on-pr && github.event_name == 'pull_request' }}
+        uses: ./.toolkit/actions/pr-comment
+        with:
+          marker: ml-pipeline
+          body: |
+            ### 🧠 ML pipeline — ${{ job.status }}
+
+            | | |
+            |---|---|
+            | Metric | `${{ steps.gate.outputs.metric || 'n/a' }}` |
+            | Gate | ${{ steps.gate.outputs.summary || 'not evaluated' }} |
+            | Registered | ${{ (inputs.registry-uri != '' && steps.gate.outputs.passed == 'true') && '✅ yes' || '❌ no' }} |
+            | Commit | `${{ github.sha }}` |
+
+      - name: Notify
+        if: ${{ always() && github.event_name != 'pull_request' }}
+        uses: ./.toolkit/actions/notify
+        with:
+          status: ${{ job.status }}
+          title: ML pipeline — ${{ job.status }}
+          slack-webhook: ${{ secrets.SLACK_WEBHOOK }}
+          discord-webhook: ${{ secrets.DISCORD_WEBHOOK }}
+          fields: |
+            {"Metric":"${{ steps.gate.outputs.metric || 'n/a' }}","Registered":"${{ (inputs.registry-uri != '' && steps.gate.outputs.passed == 'true') && 'yes' || 'no' }}"}

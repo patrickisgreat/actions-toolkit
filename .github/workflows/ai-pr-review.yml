@@ -1,0 +1,185 @@
+# Automated PR review by whichever agent the repo is configured for. Opt-in and cost-aware
+# by design.
+#
+# It posts one review comment per PR, edited in place on re-runs. It never pushes code (the
+# job token is `contents: read`) and never approves or merges — a human owns that.
+#
+# ── Cost levers, all on by default ────────────────────────────────────────────────────
+#   • `synchronize` is NOT a trigger. It fires on every push to an open PR, and leaving it
+#     in re-runs a full review per commit — the dominant cost driver by a wide margin.
+#     Reviews happen on open, reopen, and ready-for-review. Re-trigger by closing/reopening.
+#   • Drafts are skipped: reviewing work-in-progress spends tokens on code about to change.
+#   • Docs-only and lockfile-only PRs are skipped via `paths-ignore` at the caller.
+#   • Dependabot is skipped — its runs use the Dependabot secret store, which does not
+#     expose Actions secrets, so the job can only ever fail with a 401.
+#   • Fork PRs are skipped for the same reason: no secrets under `pull_request`.
+#   • `concurrency` cancels a superseded review so you only pay for the latest.
+#   • The model is a parameter; `sonnet` is the default because it catches PR-level
+#     correctness and cleanup issues at a fraction of the cost of a frontier tier.
+#
+# Usage:
+#   jobs:
+#     review:
+#       uses: patrickisgreat/actions-toolkit/.github/workflows/ai-pr-review.yml@v1
+#       with:
+#         provider: claude
+#       secrets: inherit
+
+name: AI PR review
+
+on:
+  workflow_call:
+    inputs:
+      provider:
+        description: 'claude | openai | gemini | aider'
+        type: string
+        required: false
+        default: 'claude'
+      model:
+        description: Model override. Empty uses `default-model`.
+        type: string
+        required: false
+        default: ''
+      default-model:
+        description: 'Fallback tier: `haiku` cheapest, `sonnet` balanced, `opus` deepest.'
+        type: string
+        required: false
+        default: 'sonnet'
+      max-turns:
+        description: Cap on agent iterations, bounding a runaway review.
+        type: string
+        required: false
+        default: '25'
+      use-code-review-plugin:
+        description: |
+          'true to run Anthropic''s `/code-review` plugin instead of the built-in prompt.
+          Claude only; produces inline comments on specific lines.'
+        type: boolean
+        required: false
+        default: false
+      focus:
+        description: Extra review instructions appended to the prompt.
+        type: string
+        required: false
+        default: ''
+      conventions-file:
+        description: Project agent guide the reviewer is told to read first.
+        type: string
+        required: false
+        default: 'CLAUDE.md'
+      runs-on:
+        description: Runner label.
+        type: string
+        required: false
+        default: 'ubuntu-latest'
+      timeout-minutes:
+        description: Job timeout — a hard bound on spend.
+        type: number
+        required: false
+        default: 15
+
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+      ANTHROPIC_API_KEY:
+        required: false
+      OPENAI_API_KEY:
+        required: false
+      GEMINI_API_KEY:
+        required: false
+      OPENROUTER_API_KEY:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    name: Review
+    # Every guard here maps to a specific way this job would otherwise fail or waste money.
+    # See the header comment.
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.actor != 'dependabot[bot]' &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read        # read-only: a reviewer never pushes code
+      pull-requests: write  # …but must be able to post the review
+      issues: write
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      # The plugin path produces inline, line-anchored comments; the prompt path works
+      # across all four providers. They're mutually exclusive.
+      - name: Review with the code-review plugin
+        if: ${{ inputs.use-code-review-plugin && inputs.provider == 'claude' }}
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: --model ${{ inputs.model || inputs.default-model }}
+          plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
+          plugins: 'code-review@claude-code-plugins'
+          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
+          # Without this, a clean PR produces no visible output at all — the plugin only
+          # emits inline comments for issues it finds.
+          track_progress: true
+
+      - name: Review with the configured agent
+        if: ${{ !(inputs.use-code-review-plugin && inputs.provider == 'claude') }}
+        uses: ./.toolkit/actions/agent-run
+        with:
+          provider: ${{ inputs.provider }}
+          model: ${{ inputs.model }}
+          default-model: ${{ inputs.default-model }}
+          max-turns: ${{ inputs.max-turns }}
+          claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          gemini-api-key: ${{ secrets.GEMINI_API_KEY }}
+          openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+          github-token: ${{ github.token }}
+          # No push-branch, so the safety net stays off — this job only comments.
+          prompt: |
+            You are reviewing pull request #${{ github.event.pull_request.number }}
+            ("${{ github.event.pull_request.title }}") in ${{ github.repository }}.
+
+            Keep this review focused and economical — you are a cost-aware reviewer. A
+            tight, high-signal review is more useful than an exhaustive one.
+
+            Steps:
+            1. Read the diff:
+               gh pr diff ${{ github.event.pull_request.number }} --repo ${{ github.repository }}
+            2. Read `${{ inputs.conventions-file }}` if it exists (this project's agent
+               guide, whatever agent you are) and `docs/LEARNINGS.md` if it exists, so the
+               review reflects this project's conventions and known failure modes.
+            3. Review for, in priority order:
+               - Correctness bugs and broken edge cases
+               - Security issues (injection, secrets, authz, unsafe input handling)
+               - Scope drift versus the linked issue or stated "Out of scope"
+               - Missing or weak tests for the behaviour that changed
+               - Violations of the project's documented conventions
+            4. Post exactly ONE review comment on the PR. Do NOT post multiple comments and
+               do NOT push code. Start it with the marker line:
+                 <!-- actions-toolkit:ai-pr-review -->
+               If a comment with that marker already exists, EDIT it rather than adding a
+               new one. Structure it as: a one-line verdict, then a short bulleted list of
+               concrete findings with `file:line` where possible, then "Nits" if any.
+               If the PR looks good, say so briefly — do not invent problems to list.
+            5. Do NOT approve or request changes formally. A human owns the merge decision.
+
+            ${{ inputs.focus }}
