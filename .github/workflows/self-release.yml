@@ -1,0 +1,67 @@
+# Releases for this repo, and the moving `v1` tag that every consumer pins to.
+#
+# It calls the toolkit's own `release-please.yml`, which is the point: the release pipeline
+# we ship is the release pipeline we use. If it breaks, it breaks here first.
+#
+# `move-major-tag: true` is what makes `@v1` work. release-please cuts `v1.4.0`; this then
+# force-moves `v1` onto that commit. Consumers pinned to `@v1` pick it up on their next run,
+# so **every merge to main is a live change for everyone on `@v1`** — see
+# docs/VERSIONING.md for what that obliges us to.
+#
+# `RELEASE_TOKEN` is optional but wanted here: pushes made with `GITHUB_TOKEN` do not
+# trigger other workflows, so without it the release commit never fires self-ci.
+
+name: Self release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never run two releases at once — the second would race the first's tag move.
+  group: self-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    uses: ./.github/workflows/release-please.yml
+    with:
+      # `simple` tracks the version in version.txt; this repo ships YAML, not a package.
+      config-file: release-please-config.json
+      manifest-file: .release-please-manifest.json
+      auto-merge: true
+      move-major-tag: true
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: read
+      statuses: read
+      actions: read
+    secrets:
+      RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+
+  announce:
+    name: Announce
+    needs: [release]
+    if: ${{ needs.release.outputs.release-created == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Summarize the release
+        uses: ./actions/notify
+        with:
+          status: success
+          title: actions-toolkit ${{ needs.release.outputs.tag-name }} released
+          text: |
+            Consumers pinned to `@v${{ needs.release.outputs.major }}` pick this up on their
+            next workflow run.
+          url: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.release.outputs.tag-name }}
+          fields: |
+            {"Version":"${{ needs.release.outputs.version }}","Major tag":"v${{ needs.release.outputs.major }}"}
