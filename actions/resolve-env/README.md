@@ -34,7 +34,7 @@ shouldn't take down the build — so check the log if a variable seems absent.
 |---|---|---|---|
 | `mappings` | no | `""` | Newline-separated `KEY=SECRET_NAME` pairs resolved against `secrets-json`. |
 | `literal-vars` | no | `""` | Newline-separated `KEY=value` pairs exported as-is (and masked). |
-| `secrets-json` | no | `{}` | `${{ toJSON(secrets) }}` from the calling workflow. |
+| `secrets-json` | no | `{}` | The toJSON(secrets) expression, passed in from the calling workflow. |
 | `mask-literals` | no | `true` | false to skip masking `literal-vars` (for genuinely public config). |
 | `required` | no | `""` | Comma-separated KEY names that must resolve to a non-empty value. Missing ones fail the step instead of warning. |
 

@@ -177,7 +177,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: patrickisgreat/actions-toolkit
-          ref: ${{ github.job_workflow_sha || 'main' }}
+          ref: ${{ github.job_workflow_sha || github.sha }}
           path: .toolkit
 
       - name: Find changed roots
@@ -234,7 +234,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: patrickisgreat/actions-toolkit
-          ref: ${{ github.job_workflow_sha || 'main' }}
+          ref: ${{ github.job_workflow_sha || github.sha }}
           path: .toolkit
 
       - name: Authenticate to AWS
@@ -326,7 +326,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: patrickisgreat/actions-toolkit
-          ref: ${{ github.job_workflow_sha || 'main' }}
+          ref: ${{ github.job_workflow_sha || github.sha }}
           path: .toolkit
 
       - name: Authenticate to AWS

@@ -91,6 +91,11 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      # The action lists the PR's commits through the API; without this it fails with
+      # "Resource not accessible by integration" before it lints anything.
+      pull-requests: read
     steps:
       - uses: actions/checkout@v7
         with:
