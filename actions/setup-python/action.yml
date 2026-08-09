@@ -1,0 +1,160 @@
+# Python toolchain setup, uv-first, with a dependency install.
+#
+# `uv` is the default because it is an order of magnitude faster than pip in CI and
+# resolves from whatever the project already has (uv.lock, pyproject.toml, or a plain
+# requirements.txt). Set `installer: pip` for projects that aren't ready to move.
+#
+# When `uv.lock` is present the install is locked and reproducible (`uv sync --frozen`),
+# which is the Python analogue of `--frozen-lockfile`. Dependabot gets the same relaxed
+# treatment as in setup-node, for the same reason.
+
+name: Setup Python
+description: Set up Python with uv (or pip), caching, and a dependency install
+
+inputs:
+  python-version:
+    description: Python version. Empty defers to `.python-version` / `pyproject.toml`.
+    required: false
+    default: '3.12'
+  installer:
+    description: 'uv | pip'
+    required: false
+    default: 'uv'
+  uv-version:
+    description: uv version to install. Empty means latest.
+    required: false
+    default: ''
+  install:
+    description: 'true to install dependencies after setup.'
+    required: false
+    default: 'true'
+  groups:
+    description: 'Dependency groups/extras to include, e.g. `--group dev --extra ml`. uv only.'
+    required: false
+    default: '--all-extras --dev'
+  requirements:
+    description: 'Requirements file for the pip installer, or when no pyproject.toml exists.'
+    required: false
+    default: 'requirements.txt'
+  frozen-lockfile:
+    description: 'auto | true | false. `auto` means strict, except on Dependabot PRs.'
+    required: false
+    default: 'auto'
+  working-directory:
+    description: Directory to run in.
+    required: false
+    default: '.'
+  cache:
+    description: 'true to cache the resolver/download cache.'
+    required: false
+    default: 'true'
+
+outputs:
+  python-version:
+    description: The Python version actually installed.
+    value: ${{ steps.resolve.outputs.python_version }}
+  installer:
+    description: The resolved installer (`uv` or `pip`).
+    value: ${{ inputs.installer }}
+  venv:
+    description: Path to the virtualenv uv created, if any.
+    value: ${{ steps.resolve.outputs.venv }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up uv
+      if: inputs.installer == 'uv'
+      uses: astral-sh/setup-uv@v9
+      with:
+        version: ${{ inputs.uv-version }}
+        enable-cache: ${{ inputs.cache }}
+        cache-dependency-glob: |
+          ${{ inputs.working-directory }}/uv.lock
+          ${{ inputs.working-directory }}/pyproject.toml
+          ${{ inputs.working-directory }}/requirements*.txt
+
+    - name: Set up Python
+      if: inputs.installer == 'pip'
+      uses: actions/setup-python@v7
+      with:
+        python-version: ${{ inputs.python-version }}
+        cache: ${{ inputs.cache == 'true' && 'pip' || '' }}
+        cache-dependency-path: ${{ inputs.working-directory }}/${{ inputs.requirements }}
+
+    - name: Install dependencies
+      id: resolve
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        INSTALLER: ${{ inputs.installer }}
+        PY_VERSION: ${{ inputs.python-version }}
+        DO_INSTALL: ${{ inputs.install }}
+        GROUPS: ${{ inputs.groups }}
+        REQUIREMENTS: ${{ inputs.requirements }}
+        FROZEN: ${{ inputs.frozen-lockfile }}
+        ACTOR: ${{ github.actor }}
+      run: |
+        set -euo pipefail
+
+        frozen="$FROZEN"
+        if [ "$frozen" = "auto" ]; then
+          if [ "$ACTOR" = "dependabot[bot]" ]; then
+            frozen=false
+            echo "::notice::Dependabot run — allowing the lockfile to be updated."
+          else
+            frozen=true
+          fi
+        fi
+
+        venv=''
+
+        if [ "$INSTALLER" = "uv" ]; then
+          # uv manages the interpreter itself, so pin it here rather than via setup-python.
+          if [ -n "$PY_VERSION" ]; then
+            uv python install "$PY_VERSION"
+            uv python pin "$PY_VERSION"
+          fi
+
+          if [ "$DO_INSTALL" = "true" ]; then
+            if [ -f pyproject.toml ]; then
+              # shellcheck disable=SC2086
+              if [ "$frozen" = "true" ] && [ -f uv.lock ]; then
+                uv sync --frozen $GROUPS
+              else
+                uv sync $GROUPS
+              fi
+              venv="$PWD/.venv"
+              # Put the venv on PATH for every later step in the job.
+              echo "$venv/bin" >> "$GITHUB_PATH"
+              echo "VIRTUAL_ENV=$venv" >> "$GITHUB_ENV"
+            elif [ -f "$REQUIREMENTS" ]; then
+              uv venv
+              venv="$PWD/.venv"
+              echo "$venv/bin" >> "$GITHUB_PATH"
+              echo "VIRTUAL_ENV=$venv" >> "$GITHUB_ENV"
+              uv pip install -r "$REQUIREMENTS"
+            else
+              echo "::warning::Neither pyproject.toml nor '$REQUIREMENTS' found — nothing installed."
+            fi
+          fi
+          resolved="$(uv run python -c 'import platform; print(platform.python_version())' 2>/dev/null || python3 --version | cut -d' ' -f2)"
+        else
+          if [ "$DO_INSTALL" = "true" ]; then
+            python -m pip install --upgrade pip
+            if [ -f "$REQUIREMENTS" ]; then
+              python -m pip install -r "$REQUIREMENTS"
+            elif [ -f pyproject.toml ]; then
+              python -m pip install -e '.[dev]' || python -m pip install -e .
+            else
+              echo "::warning::Neither '$REQUIREMENTS' nor pyproject.toml found — nothing installed."
+            fi
+          fi
+          resolved="$(python --version | cut -d' ' -f2)"
+        fi
+
+        {
+          echo "python_version=$resolved"
+          echo "venv=$venv"
+        } >> "$GITHUB_OUTPUT"
+        echo "Python $resolved via $INSTALLER"

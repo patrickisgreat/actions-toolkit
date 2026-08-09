@@ -1,0 +1,61 @@
+# Rust toolchain setup with a shared cargo cache.
+#
+# Uses actions-rust-lang/setup-rust-toolchain, which reads `rust-toolchain.toml` when
+# present and wires up the (substantial) cargo registry + target-dir cache. Rust CI without
+# that cache is dominated by rebuild time, so caching is on by default.
+
+name: Setup Rust
+description: Install a Rust toolchain with components and a warm cargo cache
+
+inputs:
+  toolchain:
+    description: 'Toolchain spec: `stable`, `nightly`, `1.83.0`, or empty to read rust-toolchain.toml.'
+    required: false
+    default: 'stable'
+  components:
+    description: 'Comma-separated components, e.g. `clippy,rustfmt`.'
+    required: false
+    default: 'clippy,rustfmt'
+  targets:
+    description: Comma-separated cross-compilation targets.
+    required: false
+    default: ''
+  cache:
+    description: 'true to enable the cargo cache.'
+    required: false
+    default: 'true'
+  cache-key:
+    description: Extra discriminator appended to the cache key.
+    required: false
+    default: ''
+  working-directory:
+    description: Directory containing Cargo.toml.
+    required: false
+    default: '.'
+
+outputs:
+  rustc-version:
+    description: The rustc version string.
+    value: ${{ steps.version.outputs.rustc }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: ${{ inputs.components }}
+        target: ${{ inputs.targets }}
+        cache: ${{ inputs.cache }}
+        cache-key: ${{ inputs.cache-key }}
+        cache-workspaces: ${{ inputs.working-directory }}
+
+    - name: Report version
+      id: version
+      shell: bash
+      run: |
+        set -euo pipefail
+        rustc_version="$(rustc --version)"
+        echo "rustc=$rustc_version" >> "$GITHUB_OUTPUT"
+        echo "$rustc_version"

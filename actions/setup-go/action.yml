@@ -1,0 +1,72 @@
+# Go toolchain setup with module download and optional golangci-lint.
+#
+# Defaults to reading the version from `go.mod`, which is the only version declaration a
+# Go repo should have. Module and build caches are handled by setup-go itself.
+
+name: Setup Go
+description: Set up Go from go.mod, warm the module cache, and optionally install golangci-lint
+
+inputs:
+  go-version:
+    description: Explicit Go version. Empty reads `go-version-file`.
+    required: false
+    default: ''
+  go-version-file:
+    description: File to read the version from.
+    required: false
+    default: 'go.mod'
+  download:
+    description: 'true to run `go mod download` after setup.'
+    required: false
+    default: 'true'
+  golangci-lint:
+    description: 'true to install golangci-lint (does not run it).'
+    required: false
+    default: 'false'
+  golangci-lint-version:
+    description: golangci-lint version.
+    required: false
+    default: 'latest'
+  working-directory:
+    description: Directory to run in.
+    required: false
+    default: '.'
+  cache:
+    description: 'true to enable build/module caching.'
+    required: false
+    default: 'true'
+
+outputs:
+  go-version:
+    description: The Go version actually installed.
+    value: ${{ steps.go.outputs.go-version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Go
+      id: go
+      uses: actions/setup-go@v7
+      with:
+        go-version: ${{ inputs.go-version }}
+        go-version-file: ${{ inputs.go-version == '' && format('{0}/{1}', inputs.working-directory, inputs.go-version-file) || '' }}
+        cache: ${{ inputs.cache }}
+        cache-dependency-path: ${{ inputs.working-directory }}/go.sum
+
+    - name: Download modules
+      if: inputs.download == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+        go mod download
+
+    - name: Install golangci-lint
+      if: inputs.golangci-lint == 'true'
+      shell: bash
+      env:
+        LINT_VERSION: ${{ inputs.golangci-lint-version }}
+      run: |
+        set -euo pipefail
+        go install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${LINT_VERSION}"
+        golangci-lint --version
