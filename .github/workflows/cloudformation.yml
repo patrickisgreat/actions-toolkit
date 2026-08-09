@@ -1,0 +1,392 @@
+# CloudFormation change set on PRs, execute on merge — the same review gate the Terraform
+# workflow gives you, for stacks CloudFormation owns.
+#
+# `mode` picks the half:
+#   change-set → create the change set, comment the resource diff, leave it unexecuted
+#   execute    → execute a change set created earlier, by name
+#   deploy     → change set and execute in one run
+#   delete     → tear the stack down (for ephemeral PR environments)
+#
+# Multiple stacks run from one call via the `stacks` matrix input, so an app with a
+# network, data, and service stack deploys in a defined order rather than three copies of
+# this job.
+#
+# Linting is a separate job: `cfn-lint` catches the class of error that a change set can't,
+# because a template with a bad intrinsic function never gets far enough to produce one.
+#
+# Usage:
+#   jobs:
+#     plan:
+#       if: github.event_name == 'pull_request'
+#       uses: patrickisgreat/actions-toolkit/.github/workflows/cloudformation.yml@v1
+#       with:
+#         mode: change-set
+#         stack-name: my-api
+#         template: infra/api.yaml
+#         aws-region: us-east-1
+#         aws-role-to-assume: arn:aws:iam::123456789012:role/gha-cfn-plan
+#       permissions: { contents: read, pull-requests: write, id-token: write }
+
+name: CloudFormation
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: 'change-set | execute | deploy | delete'
+        type: string
+        required: false
+        default: 'change-set'
+      stack-name:
+        description: Stack name. Ignored when `stacks` is set.
+        type: string
+        required: false
+        default: ''
+      template:
+        description: Template path or S3 URL. Ignored when `stacks` is set.
+        type: string
+        required: false
+        default: ''
+      stacks:
+        description: |
+          JSON array of stack objects for a multi-stack deploy, e.g.
+          `[{"stack-name":"net","template":"infra/net.yaml"},{"stack-name":"api","template":"infra/api.yaml"}]`.
+          Each object may carry `parameters`, `capabilities`, and `tags` overrides.
+          Deployed strictly in order — a service stack that imports a network stack's
+          exports must not race it.
+        type: string
+        required: false
+        default: ''
+      parameters:
+        description: Newline-separated `Key=Value` parameters applied to every stack.
+        type: string
+        required: false
+        default: ''
+      parameters-file:
+        description: JSON parameters file in the AWS CLI shape.
+        type: string
+        required: false
+        default: ''
+      capabilities:
+        description: Comma-separated capabilities.
+        type: string
+        required: false
+        default: 'CAPABILITY_IAM'
+      tags:
+        description: Newline-separated `Key=Value` tags.
+        type: string
+        required: false
+        default: ''
+      change-set-name:
+        description: |
+          Change set name. Set the same value on the `change-set` and `execute` runs so
+          the second executes exactly what the first produced.
+        type: string
+        required: false
+        default: ''
+      role-arn:
+        description: CloudFormation service role ARN.
+        type: string
+        required: false
+        default: ''
+      package:
+        description: 'true to `aws cloudformation package` before deploying (SAM, large templates).'
+        type: boolean
+        required: false
+        default: false
+      s3-bucket:
+        description: Bucket for packaged artifacts.
+        type: string
+        required: false
+        default: ''
+      fail-on-replacement:
+        description: 'true to fail when the change set would replace any resource.'
+        type: boolean
+        required: false
+        default: false
+      termination-protection:
+        description: 'true to enable termination protection after a successful deploy.'
+        type: boolean
+        required: false
+        default: false
+
+      lint:
+        description: 'true to run cfn-lint over `lint-paths` before touching AWS.'
+        type: boolean
+        required: false
+        default: true
+      lint-paths:
+        description: Space-separated template globs for cfn-lint.
+        type: string
+        required: false
+        default: 'infra/**/*.yaml infra/**/*.yml infra/**/*.json'
+      lint-ignore:
+        description: 'Comma-separated cfn-lint rule IDs to ignore, e.g. `W3011,W2001`.'
+        type: string
+        required: false
+        default: ''
+      guard:
+        description: |
+          'true to run cfn-guard policy checks. Needs `guard-rules`; enforces org policy
+          (encryption, no public buckets) that cfn-lint does not cover.'
+        type: boolean
+        required: false
+        default: false
+      guard-rules:
+        description: Path to a cfn-guard rules file or directory.
+        type: string
+        required: false
+        default: ''
+
+      aws-region:
+        description: AWS region.
+        type: string
+        required: true
+      aws-role-to-assume:
+        description: OIDC role ARN. Preferred over static keys.
+        type: string
+        required: false
+        default: ''
+      environment-name:
+        description: GitHub Environment gating the deploy (where approval rules live).
+        type: string
+        required: false
+        default: ''
+      comment-on-pr:
+        description: 'true to post the change set as a sticky PR comment.'
+        type: boolean
+        required: false
+        default: true
+      notify:
+        description: 'true to send a Slack/Discord notification.'
+        type: boolean
+        required: false
+        default: true
+      runs-on:
+        description: Runner label.
+        type: string
+        required: false
+        default: 'ubuntu-latest'
+      timeout-minutes:
+        description: Per-job timeout.
+        type: number
+        required: false
+        default: 60
+
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        description: Static access key, used only when no OIDC role is given.
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        description: Static secret key.
+        required: false
+      CFN_SECRET_PARAMETERS:
+        description: |
+          Newline-separated `Key=Value` stack parameters that must not appear in `with:`.
+          Merged over `parameters`.
+        required: false
+      SLACK_WEBHOOK:
+        required: false
+      DISCORD_WEBHOOK:
+        required: false
+
+    outputs:
+      has-changes:
+        description: '`true` if any stack had changes.'
+        value: ${{ jobs.deploy.outputs.has-changes }}
+      outputs-json:
+        description: The last deployed stack's outputs as JSON.
+        value: ${{ jobs.deploy.outputs.outputs-json }}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: cfn-lint
+    if: ${{ inputs.lint }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Run cfn-lint
+        env:
+          LINT_PATHS: ${{ inputs.lint-paths }}
+          LINT_IGNORE: ${{ inputs.lint-ignore }}
+          AWS_REGION: ${{ inputs.aws-region }}
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet cfn-lint
+
+          # Resolve the globs here rather than letting cfn-lint do it, so "no templates
+          # matched" is a clear message instead of an obscure argument error.
+          shopt -s globstar nullglob
+          # shellcheck disable=SC2206
+          templates=($LINT_PATHS)
+          if [ "${#templates[@]}" -eq 0 ]; then
+            echo "::warning::No templates matched '$LINT_PATHS' — nothing to lint."
+            exit 0
+          fi
+          printf 'Linting %d template(s):\n' "${#templates[@]}"
+          printf '  %s\n' "${templates[@]}"
+
+          args=(--format github --regions "$AWS_REGION")
+          [ -n "$LINT_IGNORE" ] && args+=(--ignore-checks "${LINT_IGNORE//,/ }")
+
+          cfn-lint "${args[@]}" "${templates[@]}"
+
+      - name: Run cfn-guard
+        if: ${{ inputs.guard }}
+        env:
+          GUARD_RULES: ${{ inputs.guard-rules }}
+          LINT_PATHS: ${{ inputs.lint-paths }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GUARD_RULES" ]; then
+            echo "::error::guard: true requires guard-rules."
+            exit 1
+          fi
+          python -m pip install --quiet cloudformation-guard
+
+          shopt -s globstar nullglob
+          # shellcheck disable=SC2206
+          templates=($LINT_PATHS)
+          [ "${#templates[@]}" -gt 0 ] || { echo "::warning::No templates to check."; exit 0; }
+
+          for template in "${templates[@]}"; do
+            echo "::group::cfn-guard $template"
+            cfn-guard validate --rules "$GUARD_RULES" --data "$template" --show-summary fail
+            echo "::endgroup::"
+          done
+
+  plan:
+    name: Resolve stacks
+    runs-on: ${{ inputs.runs-on }}
+    outputs:
+      stacks: ${{ steps.resolve.outputs.stacks }}
+      count: ${{ steps.resolve.outputs.count }}
+    steps:
+      - name: Build the stack list
+        id: resolve
+        env:
+          STACKS: ${{ inputs.stacks }}
+          STACK_NAME: ${{ inputs.stack-name }}
+          TEMPLATE: ${{ inputs.template }}
+        run: |
+          set -euo pipefail
+          if [ -n "$STACKS" ]; then
+            if ! jq -e 'type == "array" and length > 0' >/dev/null 2>&1 <<< "$STACKS"; then
+              echo "::error::stacks must be a non-empty JSON array of objects."
+              exit 1
+            fi
+            missing="$(jq -r '[.[] | select(has("stack-name") | not)] | length' <<< "$STACKS")"
+            if [ "$missing" != "0" ]; then
+              echo "::error::Every entry in stacks needs a 'stack-name'."
+              exit 1
+            fi
+            stacks="$(jq -c . <<< "$STACKS")"
+          else
+            if [ -z "$STACK_NAME" ]; then
+              echo "::error::Provide either stack-name or stacks."
+              exit 1
+            fi
+            stacks="$(jq -nc --arg n "$STACK_NAME" --arg t "$TEMPLATE" \
+              '[{ "stack-name": $n, template: $t }]')"
+          fi
+          {
+            echo "stacks=$stacks"
+            echo "count=$(jq 'length' <<< "$stacks")"
+          } >> "$GITHUB_OUTPUT"
+          echo "Stacks: $stacks"
+
+  deploy:
+    name: ${{ inputs.mode }} ${{ matrix.stack['stack-name'] }}
+    needs: [lint, plan]
+    # `always()` because the lint job is skipped when `lint: false`, and a skipped
+    # dependency would otherwise skip this too.
+    if: ${{ always() && needs.plan.outputs.count != '0' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    environment:
+      name: ${{ inputs.environment-name }}
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    strategy:
+      # Strictly serial. A service stack that imports another stack's exports must not run
+      # before it, and CloudFormation will not sort that out for you.
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        stack: ${{ fromJSON(needs.plan.outputs.stacks) }}
+    outputs:
+      has-changes: ${{ steps.cfn.outputs.has-changes }}
+      outputs-json: ${{ steps.cfn.outputs.outputs-json }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Authenticate to AWS
+        uses: ./.toolkit/actions/aws-auth
+        with:
+          aws-region: ${{ inputs.aws-region }}
+          role-to-assume: ${{ inputs.aws-role-to-assume }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Deploy the stack
+        id: cfn
+        uses: ./.toolkit/actions/cloudformation-deploy
+        with:
+          stack-name: ${{ matrix.stack['stack-name'] }}
+          template: ${{ matrix.stack.template || inputs.template }}
+          mode: ${{ inputs.mode }}
+          # Per-stack overrides layered over the workflow-wide values, with secret
+          # parameters last so they always win.
+          parameters: |
+            ${{ inputs.parameters }}
+            ${{ matrix.stack.parameters }}
+            ${{ secrets.CFN_SECRET_PARAMETERS }}
+          parameters-file: ${{ matrix.stack['parameters-file'] || inputs.parameters-file }}
+          capabilities: ${{ matrix.stack.capabilities || inputs.capabilities }}
+          tags: |
+            ${{ inputs.tags }}
+            ${{ matrix.stack.tags }}
+          change-set-name: ${{ inputs.change-set-name }}
+          role-arn: ${{ matrix.stack['role-arn'] || inputs.role-arn }}
+          package: ${{ inputs.package }}
+          s3-bucket: ${{ inputs.s3-bucket }}
+          termination-protection: ${{ inputs.termination-protection }}
+          fail-on-replacement: ${{ inputs.fail-on-replacement }}
+          wait-timeout-minutes: ${{ inputs.timeout-minutes }}
+
+      - name: Comment the change set
+        if: ${{ always() && inputs.comment-on-pr && github.event_name == 'pull_request' && steps.cfn.outputs.comment-body-file != '' }}
+        uses: ./.toolkit/actions/pr-comment
+        with:
+          # One comment per stack, so a multi-stack PR gets one updating comment each.
+          marker: cloudformation-${{ matrix.stack['stack-name'] }}
+          body-file: ${{ steps.cfn.outputs.comment-body-file }}
+
+      - name: Notify
+        if: ${{ always() && inputs.notify && inputs.mode != 'change-set' }}
+        uses: ./.toolkit/actions/notify
+        with:
+          status: ${{ job.status }}
+          title: CloudFormation ${{ inputs.mode }} — ${{ job.status }}
+          slack-webhook: ${{ secrets.SLACK_WEBHOOK }}
+          discord-webhook: ${{ secrets.DISCORD_WEBHOOK }}
+          fields: |
+            {"Stack":"${{ matrix.stack['stack-name'] }}","Replacements":"${{ steps.cfn.outputs.replacements || '0' }}","Ref":"${{ github.ref_name }}"}

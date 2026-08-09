@@ -1,0 +1,385 @@
+# Terraform plan on PRs, apply on merge — the standard GitOps loop, with the plan artifact
+# carried between them.
+#
+# The two halves are one workflow because the contract between them matters: the apply job
+# downloads and applies *the same binary plan* the reviewer approved. If it re-planned, the
+# thing that ran would not be the thing that was reviewed, and the PR comment would be
+# decoration rather than a gate.
+#
+# `mode` selects the half:
+#   plan  → plan every changed root, comment the diff, upload the plan artifacts
+#   apply → download the artifacts and apply them
+#   both  → plan then apply in one run (for a `workflow_dispatch` or a trunk-based repo)
+#
+# Which roots run is discovered from the diff by default, so a monorepo with thirty
+# environments only plans the ones that changed. Set `directories` to override.
+#
+# Usage:
+#   jobs:
+#     plan:
+#       if: github.event_name == 'pull_request'
+#       uses: patrickisgreat/actions-toolkit/.github/workflows/terraform-plan-apply.yml@v1
+#       with:
+#         mode: plan
+#         root-glob: 'environments/**'
+#         aws-role-to-assume: arn:aws:iam::1234:role/gha-plan
+#         aws-region: us-east-1
+#       permissions: { contents: read, pull-requests: write, id-token: write }
+
+name: Terraform plan/apply
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: 'plan | apply | both'
+        type: string
+        required: false
+        default: 'plan'
+      binary:
+        description: 'terraform | tofu'
+        type: string
+        required: false
+        default: 'terraform'
+      version:
+        description: 'Version, or `auto` to read the version file.'
+        type: string
+        required: false
+        default: 'auto'
+      directories:
+        description: |
+          JSON array of root directories to operate on. Empty discovers them from the diff
+          using `root-glob` and `root-marker`.
+        type: string
+        required: false
+        default: ''
+      root-glob:
+        description: Glob matched against changed files during discovery.
+        type: string
+        required: false
+        default: 'environments/**'
+      root-marker:
+        description: File that marks a directory as a Terraform root during discovery.
+        type: string
+        required: false
+        default: 'main.tf'
+      backend-config:
+        description: Newline-separated `key=value` backend settings or `.hcl` paths.
+        type: string
+        required: false
+        default: ''
+      var-files:
+        description: Newline-separated `.tfvars` paths.
+        type: string
+        required: false
+        default: ''
+      vars:
+        description: Newline-separated `key=value` variables.
+        type: string
+        required: false
+        default: ''
+      workspace:
+        description: Workspace to select.
+        type: string
+        required: false
+        default: ''
+
+      artifact-prefix:
+        description: Prefix for the uploaded plan artifacts.
+        type: string
+        required: false
+        default: 'tfplan'
+      comment-on-pr:
+        description: 'true to post each plan as a sticky PR comment.'
+        type: boolean
+        required: false
+        default: true
+      fail-on-destroy:
+        description: |
+          'true to fail the plan when it would destroy anything. Worth turning on for
+          production roots — an unintended destroy is the expensive mistake here.'
+        type: boolean
+        required: false
+        default: false
+      environment-name:
+        description: GitHub Environment gating the apply job.
+        type: string
+        required: false
+        default: ''
+
+      aws-region:
+        description: AWS region, when the backend or providers need AWS.
+        type: string
+        required: false
+        default: ''
+      aws-role-to-assume:
+        description: OIDC role ARN for AWS.
+        type: string
+        required: false
+        default: ''
+      gcp-workload-identity-provider:
+        description: WIF provider for GCP.
+        type: string
+        required: false
+        default: ''
+      gcp-service-account:
+        description: Service account to impersonate for GCP.
+        type: string
+        required: false
+        default: ''
+      runs-on:
+        description: Runner label.
+        type: string
+        required: false
+        default: 'ubuntu-latest'
+      timeout-minutes:
+        description: Per-job timeout.
+        type: number
+        required: false
+        default: 30
+
+    secrets:
+      TF_SECRET_VARS:
+        description: |
+          Newline-separated `key=value` Terraform variables passed as `-var`. Use this for
+          anything that must not appear in `with:`.
+        required: false
+      SLACK_WEBHOOK:
+        required: false
+      DISCORD_WEBHOOK:
+        required: false
+
+    outputs:
+      directories:
+        description: JSON array of the roots that were planned.
+        value: ${{ jobs.discover.outputs.directories }}
+      has-changes:
+        description: '`true` if any root had changes.'
+        value: ${{ jobs.plan.outputs.has-changes }}
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    name: Discover roots
+    runs-on: ${{ inputs.runs-on }}
+    outputs:
+      directories: ${{ steps.pick.outputs.directories }}
+      count: ${{ steps.pick.outputs.count }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # changed-files needs history to compute a merge base.
+          fetch-depth: 0
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Find changed roots
+        id: changed
+        if: ${{ inputs.directories == '' }}
+        uses: ./.toolkit/actions/changed-files
+        with:
+          matrix-glob: ${{ inputs.root-glob }}
+          matrix-marker: ${{ inputs.root-marker }}
+
+      - name: Pick the directory set
+        id: pick
+        env:
+          EXPLICIT: ${{ inputs.directories }}
+          DISCOVERED: ${{ steps.changed.outputs.directories }}
+        run: |
+          set -euo pipefail
+          directories="${EXPLICIT:-${DISCOVERED:-[]}}"
+          if ! jq -e 'type == "array"' >/dev/null 2>&1 <<< "$directories"; then
+            echo "::error::directories must be a JSON array."
+            exit 1
+          fi
+          count="$(jq 'length' <<< "$directories")"
+          {
+            echo "directories=$(jq -c . <<< "$directories")"
+            echo "count=$count"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$count" -eq 0 ]; then
+            echo "::notice::No Terraform roots changed — nothing to plan."
+          else
+            echo "Planning $count root(s): $directories"
+          fi
+
+  plan:
+    name: Plan ${{ matrix.directory }}
+    needs: [discover]
+    if: ${{ needs.discover.outputs.count != '0' && (inputs.mode == 'plan' || inputs.mode == 'both') }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        directory: ${{ fromJSON(needs.discover.outputs.directories) }}
+    outputs:
+      has-changes: ${{ steps.plan.outputs.has-changes }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Authenticate to AWS
+        if: ${{ inputs.aws-role-to-assume != '' }}
+        uses: ./.toolkit/actions/aws-auth
+        with:
+          aws-region: ${{ inputs.aws-region }}
+          role-to-assume: ${{ inputs.aws-role-to-assume }}
+
+      - name: Authenticate to GCP
+        if: ${{ inputs.gcp-workload-identity-provider != '' }}
+        uses: ./.toolkit/actions/gcp-auth
+        with:
+          workload-identity-provider: ${{ inputs.gcp-workload-identity-provider }}
+          service-account: ${{ inputs.gcp-service-account }}
+
+      - name: Set up Terraform
+        uses: ./.toolkit/actions/setup-terraform
+        with:
+          binary: ${{ inputs.binary }}
+          version: ${{ inputs.version }}
+
+      - name: Plan
+        id: plan
+        uses: ./.toolkit/actions/terraform-plan
+        with:
+          working-directory: ${{ matrix.directory }}
+          binary: ${{ inputs.binary }}
+          backend-config: ${{ inputs.backend-config }}
+          var-files: ${{ inputs.var-files }}
+          vars: |
+            ${{ inputs.vars }}
+            ${{ secrets.TF_SECRET_VARS }}
+          workspace: ${{ inputs.workspace }}
+
+      - name: Comment the plan
+        if: ${{ inputs.comment-on-pr && github.event_name == 'pull_request' }}
+        uses: ./.toolkit/actions/pr-comment
+        with:
+          # One comment per root, so a multi-root PR gets one updating comment each rather
+          # than one giant comment or a pile of duplicates.
+          marker: terraform-plan-${{ matrix.directory }}
+          body-file: ${{ steps.plan.outputs.comment-body-file }}
+
+      - name: Fail on destroy
+        if: ${{ inputs.fail-on-destroy && steps.plan.outputs.destroys == 'true' }}
+        env:
+          DESTROY_COUNT: ${{ steps.plan.outputs.destroy }}
+          DIRECTORY: ${{ matrix.directory }}
+        run: |
+          set -euo pipefail
+          echo "::error::Plan for '$DIRECTORY' would destroy $DESTROY_COUNT resource(s) and fail-on-destroy is set."
+          exit 1
+
+      - name: Upload the plan
+        if: ${{ steps.plan.outputs.has-changes == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          # The directory path is slashed; artifact names can't contain `/`.
+          name: ${{ inputs.artifact-prefix }}-${{ hashFiles(format('{0}/**/*.tf', matrix.directory)) }}-${{ strategy.job-index }}
+          path: ${{ steps.plan.outputs.plan-file }}
+          retention-days: 5
+          if-no-files-found: error
+
+  apply:
+    name: Apply ${{ matrix.directory }}
+    needs: [discover, plan]
+    # `always()` because `plan` is skipped in `mode: apply`, and a skipped dependency
+    # would otherwise skip this job too.
+    if: ${{ always() && needs.discover.outputs.count != '0' && (inputs.mode == 'apply' || inputs.mode == 'both') && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    environment:
+      name: ${{ inputs.environment-name }}
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      # Applies are serialized: two roots writing to overlapping state or shared resources
+      # concurrently is how you get a lock timeout at best and a corrupt plan at worst.
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        directory: ${{ fromJSON(needs.discover.outputs.directories) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Authenticate to AWS
+        if: ${{ inputs.aws-role-to-assume != '' }}
+        uses: ./.toolkit/actions/aws-auth
+        with:
+          aws-region: ${{ inputs.aws-region }}
+          role-to-assume: ${{ inputs.aws-role-to-assume }}
+
+      - name: Authenticate to GCP
+        if: ${{ inputs.gcp-workload-identity-provider != '' }}
+        uses: ./.toolkit/actions/gcp-auth
+        with:
+          workload-identity-provider: ${{ inputs.gcp-workload-identity-provider }}
+          service-account: ${{ inputs.gcp-service-account }}
+
+      - name: Set up Terraform
+        uses: ./.toolkit/actions/setup-terraform
+        with:
+          binary: ${{ inputs.binary }}
+          version: ${{ inputs.version }}
+
+      - name: Download the reviewed plan
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: ${{ inputs.artifact-prefix }}-*
+          merge-multiple: true
+          path: ${{ matrix.directory }}
+
+      - name: Apply
+        uses: ./.toolkit/actions/terraform-apply
+        with:
+          working-directory: ${{ matrix.directory }}
+          binary: ${{ inputs.binary }}
+          # With no artifact (a standalone `mode: apply` run), fall back to a fresh apply.
+          # terraform-apply warns loudly when it does.
+          plan-file: ${{ steps.download.outcome == 'success' && 'tfplan.binary' || '' }}
+          backend-config: ${{ inputs.backend-config }}
+          var-files: ${{ inputs.var-files }}
+          vars: |
+            ${{ inputs.vars }}
+            ${{ secrets.TF_SECRET_VARS }}
+          workspace: ${{ inputs.workspace }}
+
+      - name: Notify
+        if: ${{ always() }}
+        uses: ./.toolkit/actions/notify
+        with:
+          status: ${{ job.status }}
+          title: Terraform apply — ${{ job.status }}
+          slack-webhook: ${{ secrets.SLACK_WEBHOOK }}
+          discord-webhook: ${{ secrets.DISCORD_WEBHOOK }}
+          fields: |
+            {"Root":"${{ matrix.directory }}","Ref":"${{ github.ref_name }}"}

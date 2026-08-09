@@ -1,0 +1,259 @@
+# Build a container image, scan it, and push it — the job most deploy pipelines start with.
+#
+# The ordering is deliberate: build → scan → push. Scanning before the push means a
+# critical CVE stops the image from reaching the registry at all, rather than being
+# discovered after something already pulled it. The cost is that a scan failure means
+# rebuilding, which is cheap with layer caching.
+#
+# Registry auth is handled by target: `ghcr` and `dockerhub` log in with a token, `ecr`
+# runs `aws-auth` with OIDC first, `gar` runs `gcp-auth` with Workload Identity first.
+#
+# Usage:
+#   jobs:
+#     image:
+#       uses: patrickisgreat/actions-toolkit/.github/workflows/docker-build.yml@v1
+#       with:
+#         registry: ecr
+#         registry-host: 1234.dkr.ecr.us-east-1.amazonaws.com
+#         aws-region: us-east-1
+#         aws-role-to-assume: arn:aws:iam::1234:role/gha-push
+#       permissions:
+#         contents: read
+#         id-token: write
+
+name: Docker build
+
+on:
+  workflow_call:
+    inputs:
+      registry:
+        description: 'ghcr | dockerhub | ecr | gar | custom'
+        type: string
+        required: false
+        default: 'ghcr'
+      registry-host:
+        description: Registry host. Required for `ecr`, `gar`, and `custom`.
+        type: string
+        required: false
+        default: ''
+      image:
+        description: Image path without the host. Defaults to the repository name.
+        type: string
+        required: false
+        default: ''
+      context:
+        description: Build context.
+        type: string
+        required: false
+        default: '.'
+      file:
+        description: Dockerfile path.
+        type: string
+        required: false
+        default: ''
+      target:
+        description: Dockerfile stage.
+        type: string
+        required: false
+        default: ''
+      platforms:
+        description: Build platforms.
+        type: string
+        required: false
+        default: 'linux/amd64'
+      build-args:
+        description: Newline-separated `KEY=value` build arguments. Never secrets.
+        type: string
+        required: false
+        default: ''
+      push:
+        description: |
+          'true to push. Callers normally set this to
+          `github.event_name != ''pull_request''` so PRs validate the build without
+          publishing.'
+        type: boolean
+        required: false
+        default: true
+      extra-tags:
+        description: Extra docker/metadata-action tag rules.
+        type: string
+        required: false
+        default: ''
+      cache:
+        description: 'gha | registry | none'
+        type: string
+        required: false
+        default: 'gha'
+      provenance:
+        description: 'true to attach SLSA build provenance.'
+        type: boolean
+        required: false
+        default: false
+      sbom:
+        description: 'true to attach an SBOM.'
+        type: boolean
+        required: false
+        default: false
+
+      scan:
+        description: 'true to run a Trivy scan on the built image before pushing.'
+        type: boolean
+        required: false
+        default: true
+      scan-severity:
+        description: Severities that fail the scan.
+        type: string
+        required: false
+        default: 'CRITICAL,HIGH'
+      scan-fail:
+        description: 'true to block the push when the scan finds something.'
+        type: boolean
+        required: false
+        default: false
+
+      aws-region:
+        description: AWS region, for `ecr`.
+        type: string
+        required: false
+        default: ''
+      aws-role-to-assume:
+        description: OIDC role ARN, for `ecr`.
+        type: string
+        required: false
+        default: ''
+      gcp-workload-identity-provider:
+        description: WIF provider, for `gar`.
+        type: string
+        required: false
+        default: ''
+      gcp-service-account:
+        description: Service account to impersonate, for `gar`.
+        type: string
+        required: false
+        default: ''
+      runs-on:
+        description: Runner label.
+        type: string
+        required: false
+        default: 'ubuntu-latest'
+      timeout-minutes:
+        description: Job timeout.
+        type: number
+        required: false
+        default: 45
+
+    secrets:
+      REGISTRY_USERNAME:
+        description: Registry username, for `dockerhub` and `custom`.
+        required: false
+      REGISTRY_PASSWORD:
+        description: Registry password/token, for `dockerhub` and `custom`.
+        required: false
+
+    outputs:
+      image:
+        description: 'Fully qualified image reference without a tag.'
+        value: ${{ jobs.build.outputs.image }}
+      digest:
+        description: 'The image digest (`sha256:…`).'
+        value: ${{ jobs.build.outputs.digest }}
+      image-digest-ref:
+        description: 'Immutable `host/repo@sha256:…` reference to hand a deploy job.'
+        value: ${{ jobs.build.outputs.image-digest-ref }}
+      version:
+        description: The primary version tag.
+        value: ${{ jobs.build.outputs.version }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build & push
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+      image-digest-ref: ${{ steps.build.outputs.image-digest-ref }}
+      version: ${{ steps.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Authenticate to AWS
+        if: ${{ inputs.registry == 'ecr' }}
+        uses: ./.toolkit/actions/aws-auth
+        with:
+          aws-region: ${{ inputs.aws-region }}
+          role-to-assume: ${{ inputs.aws-role-to-assume }}
+          ecr-login: 'true'
+
+      - name: Authenticate to GCP
+        if: ${{ inputs.registry == 'gar' }}
+        uses: ./.toolkit/actions/gcp-auth
+        with:
+          workload-identity-provider: ${{ inputs.gcp-workload-identity-provider }}
+          service-account: ${{ inputs.gcp-service-account }}
+          docker-registries: ${{ inputs.registry-host }}
+
+      # Build without pushing first so the scan gets to veto the push.
+      - name: Build
+        id: prebuild
+        if: ${{ inputs.scan }}
+        uses: ./.toolkit/actions/docker-build-push
+        with:
+          registry: ${{ inputs.registry }}
+          registry-host: ${{ inputs.registry-host }}
+          image: ${{ inputs.image }}
+          context: ${{ inputs.context }}
+          file: ${{ inputs.file }}
+          target: ${{ inputs.target }}
+          # A multi-arch build can't be loaded into the local daemon, so the scan stage
+          # builds amd64 only; the real build below still honours `platforms`.
+          platforms: 'linux/amd64'
+          build-args: ${{ inputs.build-args }}
+          push: 'false'
+          extra-tags: ${{ inputs.extra-tags }}
+          cache: ${{ inputs.cache }}
+
+      - name: Scan the image
+        if: ${{ inputs.scan }}
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.prebuild.outputs.image }}:${{ steps.prebuild.outputs.version }}
+          severity: ${{ inputs.scan-severity }}
+          ignore-unfixed: true
+          format: table
+          exit-code: ${{ inputs.scan-fail && '1' || '0' }}
+
+      - name: Build and push
+        id: build
+        uses: ./.toolkit/actions/docker-build-push
+        with:
+          registry: ${{ inputs.registry }}
+          registry-host: ${{ inputs.registry-host }}
+          image: ${{ inputs.image }}
+          context: ${{ inputs.context }}
+          file: ${{ inputs.file }}
+          target: ${{ inputs.target }}
+          platforms: ${{ inputs.platforms }}
+          build-args: ${{ inputs.build-args }}
+          push: ${{ inputs.push }}
+          extra-tags: ${{ inputs.extra-tags }}
+          cache: ${{ inputs.cache }}
+          provenance: ${{ inputs.provenance }}
+          sbom: ${{ inputs.sbom }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}

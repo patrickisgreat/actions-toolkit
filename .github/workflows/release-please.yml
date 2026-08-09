@@ -1,0 +1,223 @@
+# Conventional-commit releases via release-please, with the personal-repo auto-merge
+# workaround that threaditate needed.
+#
+# release-please opens a release PR that accumulates changelog entries, then cuts the tag
+# and GitHub release when that PR merges. On an organization repo you'd let GitHub's
+# "Allow auto-merge" setting close the loop. Personal repos can't enable that setting, so
+# `gh pr merge --auto` fails with `enablePullRequestAutoMerge` — this workflow polls the
+# PR's checks itself and squash-merges when they pass.
+#
+# Two details that were learned the hard way and are load-bearing:
+#
+#   • The PR number is parsed in the shell, not in `env:`. When release-please runs without
+#     opening a PR, `steps.release.outputs.pr` is empty, and `fromJSON('')` is a
+#     template-validation error that fails the whole workflow even behind an `if:` gate.
+#
+#   • `gh pr checks --watch --required` exits non-zero both when a required check fails and
+#     when no required checks are configured at all. Those have to be told apart, or a repo
+#     with no branch protection can never release.
+#
+# Usage:
+#   jobs:
+#     release:
+#       uses: patrickisgreat/actions-toolkit/.github/workflows/release-please.yml@v1
+#       with:
+#         release-type: node
+#       permissions:
+#         contents: write
+#         pull-requests: write
+#         checks: read
+#         statuses: read
+#         actions: read
+
+name: Release Please
+
+on:
+  workflow_call:
+    inputs:
+      release-type:
+        description: 'release-please strategy: `node`, `python`, `go`, `rust`, `simple`, `terraform-module`, …'
+        type: string
+        required: false
+        default: 'simple'
+      config-file:
+        description: Path to `release-please-config.json` for a manifest-driven release.
+        type: string
+        required: false
+        default: ''
+      manifest-file:
+        description: Path to `.release-please-manifest.json`.
+        type: string
+        required: false
+        default: ''
+      target-branch:
+        description: Branch to release from.
+        type: string
+        required: false
+        default: ''
+      auto-merge:
+        description: |
+          'true to poll the release PR''s checks and squash-merge it automatically.
+          Set false when a human should approve every release.'
+        type: boolean
+        required: false
+        default: true
+      check-wait-seconds:
+        description: |
+          Seconds to wait before polling, so the `pull_request` event has time to register
+          the CI workflow. Polling immediately reports "no checks" and merges early.
+        type: number
+        required: false
+        default: 45
+      move-major-tag:
+        description: |
+          'true to force-move a `vN` tag to each release commit. This is what lets
+          consumers pin `@v1` — essential for an actions repo, meaningless for an app.'
+        type: boolean
+        required: false
+        default: false
+      runs-on:
+        description: Runner label.
+        type: string
+        required: false
+        default: 'ubuntu-latest'
+
+    secrets:
+      RELEASE_TOKEN:
+        description: |
+          PAT used instead of `GITHUB_TOKEN`. Required if the release commit must trigger
+          other workflows — pushes made with `GITHUB_TOKEN` deliberately do not.
+        required: false
+
+    outputs:
+      release-created:
+        description: '`true` when a release was cut on this run.'
+        value: ${{ jobs.release.outputs.release_created }}
+      tag-name:
+        description: The tag that was created.
+        value: ${{ jobs.release.outputs.tag_name }}
+      version:
+        description: The released version, without the leading `v`.
+        value: ${{ jobs.release.outputs.version }}
+      major:
+        description: The released major version.
+        value: ${{ jobs.release.outputs.major }}
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Release
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: write
+      pull-requests: write
+      # `gh pr checks --watch --required` queries statusCheckRollup via GraphQL; without
+      # these it answers "Resource not accessible by integration".
+      checks: read
+      statuses: read
+      actions: read
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+      major: ${{ steps.release.outputs.major }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN || github.token }}
+
+      - name: Run release-please
+        id: release
+        uses: googleapis/release-please-action@v5
+        with:
+          token: ${{ secrets.RELEASE_TOKEN || github.token }}
+          release-type: ${{ inputs.config-file == '' && inputs.release-type || '' }}
+          config-file: ${{ inputs.config-file }}
+          manifest-file: ${{ inputs.manifest-file }}
+          target-branch: ${{ inputs.target-branch }}
+
+      - name: Wait for release PR checks and merge
+        if: ${{ inputs.auto-merge && steps.release.outputs.prs_created == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          # Parsed in the shell, not via fromJSON in `env:` — see the header comment.
+          PR_JSON: ${{ steps.release.outputs.pr }}
+          WAIT_SECONDS: ${{ inputs.check-wait-seconds }}
+        run: |
+          set -euo pipefail
+
+          pr_number="$(jq -r '.number // empty' <<< "$PR_JSON")"
+          if [ -z "$pr_number" ]; then
+            echo "::error::release-please reported prs_created but produced no PR number."
+            exit 1
+          fi
+          echo "Release PR opened: #$pr_number"
+
+          echo "Waiting ${WAIT_SECONDS}s for CI to spin up…"
+          sleep "$WAIT_SECONDS"
+
+          set +e
+          checks_output="$(gh pr checks "$pr_number" --watch --required 2>&1)"
+          checks_exit=$?
+          set -e
+          printf '%s\n' "$checks_output"
+
+          if [ "$checks_exit" -ne 0 ]; then
+            # "No required checks" is fine on a personal repo with no branch protection.
+            # A genuine failure is not.
+            if grep -qiE 'no required checks' <<< "$checks_output"; then
+              echo "::notice::No required checks configured for this branch — proceeding to merge."
+            else
+              echo "::error::Required checks failed on PR #$pr_number — not merging."
+              exit 1
+            fi
+          fi
+
+          echo "Squash-merging release PR #$pr_number…"
+          gh pr merge "$pr_number" --squash
+
+  major-tag:
+    name: Move the major tag
+    needs: [release]
+    if: ${{ inputs.move-major-tag && needs.release.outputs.release_created == 'true' }}
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN || github.token }}
+
+      - name: Force-move vN to the release commit
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          TAG_NAME: ${{ needs.release.outputs.tag_name }}
+          MAJOR: ${{ needs.release.outputs.major }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$TAG_NAME" ] || [ -z "$MAJOR" ]; then
+            echo "::error::Missing tag_name or major from release-please output."
+            exit 1
+          fi
+
+          major_tag="v${MAJOR}"
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+          # Resolve the annotated release tag to its commit, then repoint vN at it.
+          target="$(git rev-list -n1 "$TAG_NAME")"
+          git tag -f -a "$major_tag" "$target" \
+            -m "Track the latest ${major_tag}.x release (${TAG_NAME})"
+          git push --force origin "refs/tags/${major_tag}"
+
+          echo "::notice::${major_tag} now points at ${TAG_NAME} (${target})."
+          {
+            echo "### 🏷️ Released ${TAG_NAME}"
+            echo
+            echo "Consumers pinned to \`@${major_tag}\` now get this release."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,278 @@
+# Deploy to Fly.io, with first-class support for per-PR ephemeral apps.
+#
+# Set `app-suffix: -pr-${{ github.event.pull_request.number }}` and
+# `create-if-missing: true` and every PR gets its own app and URL. Pair it with
+# `destroy-on-close` in a `pull_request: [closed]` job so those apps don't accumulate —
+# forgotten preview apps are the main way a Fly bill grows without anyone noticing.
+#
+# Usage:
+#   jobs:
+#     deploy:
+#       uses: patrickisgreat/actions-toolkit/.github/workflows/deploy-fly.yml@v1
+#       with:
+#         app: my-api
+#         image: ${{ needs.image.outputs.image-digest-ref }}
+#       secrets: inherit
+
+name: Deploy Fly.io
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: Fly app name. Empty reads it from the config file.
+        type: string
+        required: false
+        default: ''
+      app-suffix:
+        description: 'Appended to the app name, e.g. `-pr-42`.'
+        type: string
+        required: false
+        default: ''
+      config:
+        description: Fly config file.
+        type: string
+        required: false
+        default: 'fly.toml'
+      working-directory:
+        description: Directory to run flyctl from.
+        type: string
+        required: false
+        default: '.'
+      image:
+        description: Pre-built image to deploy. Empty builds remotely from the Dockerfile.
+        type: string
+        required: false
+        default: ''
+      strategy:
+        description: 'immediate | rolling | bluegreen | canary'
+        type: string
+        required: false
+        default: 'rolling'
+      region:
+        description: Primary region for a newly created app.
+        type: string
+        required: false
+        default: ''
+      org:
+        description: Fly organization.
+        type: string
+        required: false
+        default: 'personal'
+      create-if-missing:
+        description: 'true to create the app when it does not exist. Needed for per-PR apps.'
+        type: boolean
+        required: false
+        default: false
+      destroy-on-close:
+        description: |
+          'true to destroy the app instead of deploying. Call this from a
+          `pull_request: [closed]` job to clean up an ephemeral preview app.'
+        type: boolean
+        required: false
+        default: false
+      environment-name:
+        description: GitHub Environment to deploy through.
+        type: string
+        required: false
+        default: ''
+      secrets-map:
+        description: |
+          Newline-separated `FLY_SECRET_NAME=GH_SECRET_NAME` mappings, staged on the app
+          before the deploy so they ship in the same release.
+        type: string
+        required: false
+        default: ''
+      comment-on-pr:
+        description: 'true to post the app URL as a sticky PR comment.'
+        type: boolean
+        required: false
+        default: true
+      notify:
+        description: 'true to send a Slack/Discord notification.'
+        type: boolean
+        required: false
+        default: true
+      runs-on:
+        description: Runner label.
+        type: string
+        required: false
+        default: 'ubuntu-latest'
+      timeout-minutes:
+        description: Job timeout.
+        type: number
+        required: false
+        default: 30
+
+    secrets:
+      FLY_API_TOKEN:
+        description: Fly API token.
+        required: true
+      SLACK_WEBHOOK:
+        required: false
+      DISCORD_WEBHOOK:
+        required: false
+
+    outputs:
+      app:
+        description: The resolved app name.
+        value: ${{ jobs.deploy.outputs.app }}
+      url:
+        description: The app URL.
+        value: ${{ jobs.deploy.outputs.url }}
+
+permissions:
+  contents: read
+
+jobs:
+  destroy:
+    name: Destroy preview app
+    if: ${{ inputs.destroy-on-close }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Install flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Destroy
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          IN_APP: ${{ inputs.app }}
+          APP_SUFFIX: ${{ inputs.app-suffix }}
+          CONFIG: ${{ inputs.config }}
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          app="$IN_APP"
+          if [ -z "$app" ] && [ -f "$CONFIG" ]; then
+            app="$(grep -m1 -E '^\s*app\s*=' "$CONFIG" | sed -E 's/.*=\s*"?([^"]+)"?.*/\1/' | tr -d '[:space:]')"
+          fi
+          app="${app}${APP_SUFFIX}"
+          [ -n "$app" ] || { echo "::error::Could not determine the app name to destroy."; exit 1; }
+
+          # A closed PR whose app was never created, or was already cleaned up, is a
+          # normal outcome — not a failure.
+          if ! flyctl status --app "$app" >/dev/null 2>&1; then
+            echo "::notice::App '$app' does not exist — nothing to destroy."
+            exit 0
+          fi
+          flyctl apps destroy "$app" --yes
+          echo "::notice::Destroyed $app"
+
+      - name: Remove the preview comment
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: ./.toolkit/actions/pr-comment
+        with:
+          marker: deploy-fly
+          mode: delete
+
+  deploy:
+    name: Deploy
+    if: ${{ !inputs.destroy-on-close }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    environment:
+      name: ${{ inputs.environment-name }}
+      url: ${{ steps.deploy.outputs.url }}
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      app: ${{ steps.deploy.outputs.app }}
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Resolve Fly secrets
+        id: fly-secrets
+        env:
+          SECRETS_MAP: ${{ inputs.secrets-map }}
+          SECRETS_JSON: ${{ toJSON(secrets) }}
+        run: |
+          set -euo pipefail
+          # Built here rather than in resolve-env because these go to Fly as a KEY=value
+          # block, not into the runner's own environment.
+          out=''
+          if [ -n "$SECRETS_MAP" ]; then
+            while IFS= read -r line; do
+              [ -n "$line" ] || continue
+              case "$line" in \#*) continue ;; esac
+              key="${line%%=*}"
+              src="${line#*=}"
+              [ "$src" = "$line" ] && src="$key"
+              value="$(jq -r --arg n "$src" '.[$n] // ""' <<< "$SECRETS_JSON")"
+              if [ -z "$value" ]; then
+                echo "::warning::Fly secret '$key' maps to '$src', which is unset."
+                continue
+              fi
+              echo "::add-mask::$value"
+              out="${out}${key}=${value}"$'\n'
+              echo "Staged $key"
+            done <<< "$SECRETS_MAP"
+          fi
+          {
+            echo 'secrets<<__ATK_EOF__'
+            printf '%s' "$out"
+            echo '__ATK_EOF__'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to Fly.io
+        id: deploy
+        uses: ./.toolkit/actions/deploy-fly
+        with:
+          fly-api-token: ${{ secrets.FLY_API_TOKEN }}
+          app: ${{ inputs.app }}
+          app-suffix: ${{ inputs.app-suffix }}
+          config: ${{ inputs.config }}
+          working-directory: ${{ inputs.working-directory }}
+          image: ${{ inputs.image }}
+          strategy: ${{ inputs.strategy }}
+          region: ${{ inputs.region }}
+          org: ${{ inputs.org }}
+          create-if-missing: ${{ inputs.create-if-missing }}
+          secrets: ${{ steps.fly-secrets.outputs.secrets }}
+
+      - name: Comment the app URL
+        if: ${{ inputs.comment-on-pr && github.event_name == 'pull_request' }}
+        uses: ./.toolkit/actions/pr-comment
+        with:
+          marker: deploy-fly
+          body: |
+            ### 🎈 Fly.io
+
+            | | |
+            |---|---|
+            | App | `${{ steps.deploy.outputs.app }}` |
+            | URL | ${{ steps.deploy.outputs.url }} |
+            | Commit | `${{ github.sha }}` |
+
+      - name: Notify
+        if: ${{ always() && inputs.notify }}
+        uses: ./.toolkit/actions/notify
+        with:
+          status: ${{ job.status }}
+          title: Fly.io deploy — ${{ job.status }}
+          url: ${{ steps.deploy.outputs.url }}
+          slack-webhook: ${{ secrets.SLACK_WEBHOOK }}
+          discord-webhook: ${{ secrets.DISCORD_WEBHOOK }}
+          fields: |
+            {"App":"${{ steps.deploy.outputs.app }}","Strategy":"${{ inputs.strategy }}"}

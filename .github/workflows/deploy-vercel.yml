@@ -1,0 +1,170 @@
+# Deploy to Vercel and report back — a preview URL on the PR, a notification on production.
+#
+# `environment:` is wired to a GitHub Environment, which is where deployment protection
+# rules live. Setting `environment: production` and adding a required reviewer there turns
+# this into a gated deploy without touching the workflow.
+#
+# Usage:
+#   jobs:
+#     preview:
+#       if: github.event_name == 'pull_request'
+#       uses: patrickisgreat/actions-toolkit/.github/workflows/deploy-vercel.yml@v1
+#       with:
+#         environment-name: preview
+#       secrets: inherit
+
+name: Deploy Vercel
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Vercel target: `preview` or `production`.'
+        type: string
+        required: false
+        default: 'preview'
+      environment-name:
+        description: |
+          GitHub Environment to deploy through. Deployment protection rules (required
+          reviewers, wait timers, branch restrictions) are configured there, not here.
+        type: string
+        required: false
+        default: ''
+      working-directory:
+        description: Directory containing the Vercel project.
+        type: string
+        required: false
+        default: '.'
+      prebuilt:
+        description: 'true to build in the runner and upload the output.'
+        type: boolean
+        required: false
+        default: true
+      alias:
+        description: Comma-separated domains to alias after deploying.
+        type: string
+        required: false
+        default: ''
+      build-env:
+        description: 'Newline-separated `KEY=SECRET_NAME` mappings. Requires `secrets: inherit`.'
+        type: string
+        required: false
+        default: ''
+      public-env:
+        description: Newline-separated `KEY=value` pairs for non-secret build config.
+        type: string
+        required: false
+        default: ''
+      comment-on-pr:
+        description: 'true to post the deployment URL as a sticky PR comment.'
+        type: boolean
+        required: false
+        default: true
+      notify:
+        description: 'true to send a Slack/Discord notification when the webhooks are set.'
+        type: boolean
+        required: false
+        default: true
+      runs-on:
+        description: Runner label.
+        type: string
+        required: false
+        default: 'ubuntu-latest'
+      timeout-minutes:
+        description: Job timeout.
+        type: number
+        required: false
+        default: 20
+
+    secrets:
+      VERCEL_TOKEN:
+        description: Vercel access token.
+        required: true
+      VERCEL_ORG_ID:
+        description: Vercel organization/team ID.
+        required: true
+      VERCEL_PROJECT_ID:
+        description: Vercel project ID.
+        required: true
+      SLACK_WEBHOOK:
+        required: false
+      DISCORD_WEBHOOK:
+        required: false
+
+    outputs:
+      url:
+        description: The deployment URL.
+        value: ${{ jobs.deploy.outputs.url }}
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy (${{ inputs.environment }})
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    environment:
+      name: ${{ inputs.environment-name }}
+      url: ${{ steps.deploy.outputs.url }}
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the toolkit
+        uses: actions/checkout@v7
+        with:
+          repository: patrickisgreat/actions-toolkit
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .toolkit
+
+      - name: Resolve environment
+        uses: ./.toolkit/actions/resolve-env
+        with:
+          mappings: ${{ inputs.build-env }}
+          literal-vars: ${{ inputs.public-env }}
+          secrets-json: ${{ toJSON(secrets) }}
+
+      - name: Deploy to Vercel
+        id: deploy
+        uses: ./.toolkit/actions/deploy-vercel
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          environment: ${{ inputs.environment }}
+          working-directory: ${{ inputs.working-directory }}
+          prebuilt: ${{ inputs.prebuilt }}
+          alias: ${{ inputs.alias }}
+
+      - name: Comment the preview URL
+        if: ${{ inputs.comment-on-pr && github.event_name == 'pull_request' }}
+        uses: ./.toolkit/actions/pr-comment
+        with:
+          marker: deploy-vercel-${{ inputs.environment }}
+          body: |
+            ### ▲ Vercel — ${{ inputs.environment }}
+
+            | | |
+            |---|---|
+            | Deployment | ${{ steps.deploy.outputs.url }} |
+            | Inspect | ${{ steps.deploy.outputs.inspect-url }} |
+            | Commit | `${{ github.sha }}` |
+
+      - name: Notify
+        # `always()` so a failed deploy notifies too — a deploy channel that only ever
+        # reports success is not a deploy channel.
+        if: ${{ always() && inputs.notify }}
+        uses: ./.toolkit/actions/notify
+        with:
+          status: ${{ job.status }}
+          title: Vercel ${{ inputs.environment }} deploy — ${{ job.status }}
+          url: ${{ steps.deploy.outputs.url }}
+          slack-webhook: ${{ secrets.SLACK_WEBHOOK }}
+          discord-webhook: ${{ secrets.DISCORD_WEBHOOK }}
+          fields: |
+            {"Environment":"${{ inputs.environment }}","Ref":"${{ github.ref_name }}"}
