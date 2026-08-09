@@ -1,0 +1,275 @@
+# Run an LLM evaluation suite and gate the pipeline on the result.
+#
+# Prompts are code, and like code they regress — a wording change that improves one case
+# quietly breaks four others. This action runs an eval suite on every PR and turns it into
+# a pass/fail check with a diffable score, so prompt changes get the same treatment as any
+# other change.
+#
+#   runner: promptfoo (default) → runs `promptfoo eval`, reads its JSON output.
+#   runner: custom              → runs your own command; you supply a results JSON in the
+#                                 same shape (see `results-file`). Use this for DeepEval,
+#                                 Braintrust, Inspect, or a bespoke pytest harness.
+#
+# Gating is on `threshold` (minimum pass rate). `baseline-file` additionally fails the run
+# on a *regression* relative to a stored score, which catches the case where the suite was
+# already below threshold and got worse.
+#
+# Cost control matters here — an eval suite is N model calls per run. `max-cost-usd` aborts
+# the step if the suite spends more than you budgeted.
+
+name: LLM eval
+description: Run a promptfoo (or custom) LLM eval suite and gate on pass rate and cost
+
+inputs:
+  runner:
+    description: 'promptfoo | custom'
+    required: false
+    default: 'promptfoo'
+  config:
+    description: promptfoo config file.
+    required: false
+    default: 'promptfooconfig.yaml'
+  command:
+    description: 'Command to run for `runner: custom`. Must write `results-file`.'
+    required: false
+    default: ''
+  results-file:
+    description: |
+      Path to the JSON results. promptfoo writes it; a custom runner must produce
+      `{ "results": { "stats": { "successes": N, "failures": N }, ... } }` or set
+      `pass-rate-jq` to point at your own shape.
+    required: false
+    default: 'eval-results.json'
+  pass-rate-jq:
+    description: |
+      jq expression evaluated against `results-file` returning `[passes, failures]`.
+      Override this to consume a non-promptfoo results shape.
+    required: false
+    default: '[(.results.stats.successes // 0), (.results.stats.failures // 0)]'
+  threshold:
+    description: 'Minimum pass rate to succeed, as a percentage (0-100).'
+    required: false
+    default: '100'
+  baseline-file:
+    description: |
+      JSON file holding a previous score (`{"pass_rate": 92.5}`). When present, the run
+      also fails if the pass rate dropped by more than `max-regression`.
+    required: false
+    default: ''
+  max-regression:
+    description: Allowed drop in percentage points versus the baseline.
+    required: false
+    default: '0'
+  max-cost-usd:
+    description: Fail if the suite costs more than this. Empty disables the check.
+    required: false
+    default: ''
+  promptfoo-version:
+    description: promptfoo version to install.
+    required: false
+    default: 'latest'
+  cache:
+    description: 'true to let promptfoo reuse cached responses for unchanged cases.'
+    required: false
+    default: 'true'
+  concurrency:
+    description: Parallel eval requests.
+    required: false
+    default: '4'
+  working-directory:
+    description: Directory to run in.
+    required: false
+    default: '.'
+  env-vars:
+    description: |
+      Newline-separated `KEY=value` pairs exported before the run — this is how provider
+      API keys reach the eval (`OPENROUTER_API_KEY=...`, `ANTHROPIC_API_KEY=...`).
+    required: false
+    default: ''
+  fail-on-threshold:
+    description: 'false to report the score without failing the step.'
+    required: false
+    default: 'true'
+
+outputs:
+  pass-rate:
+    description: Pass rate as a percentage with one decimal place.
+    value: ${{ steps.eval.outputs.pass_rate }}
+  passes:
+    description: Number of passing cases.
+    value: ${{ steps.eval.outputs.passes }}
+  failures:
+    description: Number of failing cases.
+    value: ${{ steps.eval.outputs.failures }}
+  total:
+    description: Total cases evaluated.
+    value: ${{ steps.eval.outputs.total }}
+  cost-usd:
+    description: Total cost reported by the runner, when available.
+    value: ${{ steps.eval.outputs.cost_usd }}
+  passed:
+    description: '`true` when the suite met the threshold and regression budget.'
+    value: ${{ steps.eval.outputs.passed }}
+  comment-body-file:
+    description: Markdown summary file, ready for the `pr-comment` action.
+    value: ${{ steps.eval.outputs.comment_file }}
+  results-file:
+    description: Path to the raw results JSON.
+    value: ${{ steps.eval.outputs.results_path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Run the eval suite
+      id: eval
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        RUNNER: ${{ inputs.runner }}
+        CONFIG: ${{ inputs.config }}
+        CUSTOM_COMMAND: ${{ inputs.command }}
+        RESULTS_FILE: ${{ inputs.results-file }}
+        PASS_RATE_JQ: ${{ inputs.pass-rate-jq }}
+        THRESHOLD: ${{ inputs.threshold }}
+        BASELINE_FILE: ${{ inputs.baseline-file }}
+        MAX_REGRESSION: ${{ inputs.max-regression }}
+        MAX_COST: ${{ inputs.max-cost-usd }}
+        PROMPTFOO_VERSION: ${{ inputs.promptfoo-version }}
+        USE_CACHE: ${{ inputs.cache }}
+        CONCURRENCY: ${{ inputs.concurrency }}
+        ENV_VARS: ${{ inputs.env-vars }}
+        FAIL_ON_THRESHOLD: ${{ inputs.fail-on-threshold }}
+      run: |
+        set -euo pipefail
+
+        # ── Provider credentials ─────────────────────────────────────────────────
+        if [ -n "$ENV_VARS" ]; then
+          while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            case "$line" in \#*) continue ;; esac
+            export "$line"
+            echo "Exported ${line%%=*}"
+          done <<< "$ENV_VARS"
+        fi
+
+        # ── Run ──────────────────────────────────────────────────────────────────
+        # A failing eval is a normal outcome that this action reports on, not a step
+        # crash — so the runner's exit code is captured, not propagated.
+        set +e
+        if [ "$RUNNER" = "promptfoo" ]; then
+          [ -f "$CONFIG" ] || { echo "::error::promptfoo config '$CONFIG' does not exist."; exit 1; }
+          npm install -g "promptfoo@${PROMPTFOO_VERSION}"
+
+          args=(eval --config "$CONFIG" --output "$RESULTS_FILE" --max-concurrency "$CONCURRENCY")
+          [ "$USE_CACHE" != "true" ] && args+=(--no-cache)
+          promptfoo "${args[@]}"
+        elif [ "$RUNNER" = "custom" ]; then
+          [ -n "$CUSTOM_COMMAND" ] || { echo "::error::runner='custom' requires command."; exit 1; }
+          bash -eo pipefail -c "$CUSTOM_COMMAND"
+        else
+          set -e
+          echo "::error::runner='$RUNNER' is not supported (promptfoo|custom)."
+          exit 1
+        fi
+        runner_exit=$?
+        set -e
+        echo "Runner exited with $runner_exit."
+
+        if [ ! -f "$RESULTS_FILE" ]; then
+          echo "::error::No results at '$RESULTS_FILE'. The runner exited $runner_exit without producing output."
+          exit 1
+        fi
+
+        # ── Score ────────────────────────────────────────────────────────────────
+        read -r passes failures <<< "$(jq -r "$PASS_RATE_JQ | @tsv" "$RESULTS_FILE" | tr '\t' ' ')"
+        passes="${passes:-0}"; failures="${failures:-0}"
+        total=$(( passes + failures ))
+
+        if [ "$total" -eq 0 ]; then
+          echo "::error::The suite evaluated 0 cases. Check the config and pass-rate-jq expression."
+          exit 1
+        fi
+
+        pass_rate="$(jq -nr --argjson p "$passes" --argjson t "$total" '($p * 100 / $t) | . * 10 | round / 10')"
+
+        # promptfoo reports per-run token cost when the provider supplies it.
+        cost="$(jq -r '(.results.stats.tokenUsage.cost // .results.stats.cost // empty) | tostring' "$RESULTS_FILE" 2>/dev/null || true)"
+        [ "$cost" = "null" ] && cost=''
+
+        echo "Pass rate: ${pass_rate}% (${passes}/${total})${cost:+, cost \$${cost}}"
+
+        # ── Gates ────────────────────────────────────────────────────────────────
+        passed=true
+        reasons=()
+
+        if [ "$(jq -nr --argjson r "$pass_rate" --argjson t "$THRESHOLD" '$r >= $t')" != "true" ]; then
+          passed=false
+          reasons+=("pass rate ${pass_rate}% is below the ${THRESHOLD}% threshold")
+        fi
+
+        delta=''
+        if [ -n "$BASELINE_FILE" ] && [ -f "$BASELINE_FILE" ]; then
+          baseline="$(jq -r '.pass_rate // empty' "$BASELINE_FILE")"
+          if [ -n "$baseline" ]; then
+            delta="$(jq -nr --argjson c "$pass_rate" --argjson b "$baseline" '($c - $b) | . * 10 | round / 10')"
+            if [ "$(jq -nr --argjson d "$delta" --argjson m "$MAX_REGRESSION" '(0 - $d) > $m')" = "true" ]; then
+              passed=false
+              reasons+=("regressed ${delta} points against the ${baseline}% baseline (budget ${MAX_REGRESSION})")
+            fi
+          fi
+        fi
+
+        if [ -n "$MAX_COST" ] && [ -n "$cost" ]; then
+          if [ "$(jq -nr --argjson c "$cost" --argjson m "$MAX_COST" '$c > $m')" = "true" ]; then
+            passed=false
+            reasons+=("cost \$${cost} exceeded the \$${MAX_COST} budget")
+          fi
+        fi
+
+        # ── Report ───────────────────────────────────────────────────────────────
+        if [ "$passed" = "true" ]; then verdict="✅ **${pass_rate}%** (${passes}/${total} passed)"
+        else verdict="❌ **${pass_rate}%** (${passes}/${total} passed)"; fi
+
+        comment_file=/tmp/atk-eval-comment.md
+        {
+          printf '### 🧪 LLM eval\n\n%s\n\n' "$verdict"
+          printf '| | |\n|---|---|\n'
+          printf '| Threshold | %s%% |\n' "$THRESHOLD"
+          [ -n "$delta" ] && printf '| Change vs baseline | %s pts |\n' "$delta"
+          [ -n "$cost" ] && printf '| Cost | $%s |\n' "$cost"
+          printf '\n'
+          if [ "${#reasons[@]}" -gt 0 ]; then
+            printf 'Failed because:\n\n'
+            printf -- '- %s\n' "${reasons[@]}"
+            printf '\n'
+          fi
+          # The first few failing cases are what a reviewer actually needs.
+          failing="$(jq -r '
+            [.results.results // [] | .[] | select((.success // true) == false)][:5]
+            | if length == 0 then empty else
+                "<details><summary>First failing cases</summary>\n\n"
+                + (map("- **" + ((.testCase.description // .vars.__description // "case") | tostring) + "** — "
+                       + ((.gradingResult.reason // .error // "no reason reported") | tostring | .[0:300]))
+                   | join("\n"))
+                + "\n\n</details>"
+              end' "$RESULTS_FILE" 2>/dev/null || true)"
+          [ -n "$failing" ] && printf '%s\n' "$failing"
+        } > "$comment_file"
+
+        cat "$comment_file" >> "$GITHUB_STEP_SUMMARY"
+
+        {
+          echo "pass_rate=$pass_rate"
+          echo "passes=$passes"
+          echo "failures=$failures"
+          echo "total=$total"
+          echo "cost_usd=$cost"
+          echo "passed=$passed"
+          echo "comment_file=$comment_file"
+          echo "results_path=$RESULTS_FILE"
+        } >> "$GITHUB_OUTPUT"
+
+        if [ "$passed" != "true" ] && [ "$FAIL_ON_THRESHOLD" = "true" ]; then
+          echo "::error::Eval gate failed: $(IFS='; '; echo "${reasons[*]}")"
+          exit 1
+        fi

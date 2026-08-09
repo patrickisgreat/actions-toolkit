@@ -1,0 +1,294 @@
+# Move model weights, datasets, and eval artifacts between the runner and durable storage.
+#
+# Model artifacts are too big for the GitHub Actions artifact store and too important to
+# live only in a training job's scratch space. This action gives training and eval
+# pipelines one interface over the three places these things actually live, chosen by the
+# URI scheme:
+#
+#   s3://bucket/prefix        → S3           (authenticate with `aws-auth` first)
+#   gs://bucket/prefix        → GCS          (authenticate with `gcp-auth` first)
+#   hf://owner/repo[@rev]     → Hugging Face Hub (needs `hf-token` for private/write)
+#
+# `manifest: true` writes a `manifest.json` next to the upload recording every file's size
+# and SHA-256 plus the commit that produced it. That is what makes a model artifact
+# traceable back to the code and data that built it — without it, "which commit produced
+# the weights currently in prod?" has no answer.
+#
+# Downloads verify against the manifest when one is present, so a truncated or corrupted
+# transfer fails the job instead of silently training on half a dataset.
+
+name: ML artifact
+description: Upload or download model/dataset artifacts to S3, GCS, or the Hugging Face Hub
+
+inputs:
+  operation:
+    description: 'upload | download'
+    required: true
+  local-path:
+    description: Local file or directory.
+    required: true
+  remote-uri:
+    description: 'Remote location: `s3://…`, `gs://…`, or `hf://owner/repo[@revision]`.'
+    required: true
+  hf-token:
+    description: Hugging Face token. Required for private repos and any upload.
+    required: false
+    default: ''
+  hf-repo-type:
+    description: 'model | dataset | space'
+    required: false
+    default: 'model'
+  include:
+    description: 'Space-separated glob patterns to include. Empty means everything.'
+    required: false
+    default: ''
+  exclude:
+    description: Space-separated glob patterns to exclude.
+    required: false
+    default: ''
+  manifest:
+    description: 'true to write/verify a `manifest.json` with per-file SHA-256 checksums.'
+    required: false
+    default: 'true'
+  commit-message:
+    description: Commit message for a Hugging Face upload.
+    required: false
+    default: ''
+  storage-class:
+    description: 'S3 storage class, e.g. `STANDARD_IA` or `INTELLIGENT_TIERING`.'
+    required: false
+    default: ''
+  fail-if-missing:
+    description: 'false to make a download of a non-existent remote a no-op instead of an error.'
+    required: false
+    default: 'true'
+
+outputs:
+  uri:
+    description: The remote URI that was written to or read from.
+    value: ${{ steps.transfer.outputs.uri }}
+  files:
+    description: Number of files transferred.
+    value: ${{ steps.transfer.outputs.files }}
+  bytes:
+    description: Total bytes transferred.
+    value: ${{ steps.transfer.outputs.bytes }}
+  manifest-file:
+    description: Path to the manifest, when one was written or found.
+    value: ${{ steps.transfer.outputs.manifest_file }}
+  exists:
+    description: '`false` when a download found nothing and `fail-if-missing` was false.'
+    value: ${{ steps.transfer.outputs.exists }}
+
+runs:
+  using: composite
+  steps:
+    - name: Transfer
+      id: transfer
+      shell: bash
+      env:
+        OPERATION: ${{ inputs.operation }}
+        LOCAL_PATH: ${{ inputs.local-path }}
+        REMOTE_URI: ${{ inputs.remote-uri }}
+        HF_TOKEN: ${{ inputs.hf-token }}
+        HF_REPO_TYPE: ${{ inputs.hf-repo-type }}
+        INCLUDE: ${{ inputs.include }}
+        EXCLUDE: ${{ inputs.exclude }}
+        WRITE_MANIFEST: ${{ inputs.manifest }}
+        COMMIT_MESSAGE: ${{ inputs.commit-message }}
+        STORAGE_CLASS: ${{ inputs.storage-class }}
+        FAIL_IF_MISSING: ${{ inputs.fail-if-missing }}
+        SHA: ${{ github.sha }}
+        REPO: ${{ github.repository }}
+        RUN_ID: ${{ github.run_id }}
+        REF_NAME: ${{ github.ref_name }}
+      run: |
+        set -euo pipefail
+
+        case "$OPERATION" in
+          upload|download) ;;
+          *) echo "::error::operation='$OPERATION' is not supported (upload|download)."; exit 1 ;;
+        esac
+
+        case "$REMOTE_URI" in
+          s3://*) backend=s3 ;;
+          gs://*) backend=gcs ;;
+          hf://*) backend=hf ;;
+          *) echo "::error::remote-uri '$REMOTE_URI' must start with s3://, gs://, or hf://."; exit 1 ;;
+        esac
+        echo "Backend: $backend | $OPERATION | $LOCAL_PATH <-> $REMOTE_URI"
+
+        manifest_file=''
+        exists=true
+
+        # ── Manifest helpers ─────────────────────────────────────────────────────
+        write_manifest() {
+          local root="$1" out="$2"
+          # Sorted so the manifest is byte-stable for the same content, which makes it
+          # diffable across runs.
+          ( cd "$root" && find . -type f ! -name manifest.json -print0 \
+              | sort -z \
+              | xargs -0 shasum -a 256 \
+              | jq -Rn '[inputs | capture("^(?<sha256>[0-9a-f]{64})\\s+\\.?/?(?<path>.+)$")]' \
+            ) > /tmp/atk-files.json
+          jq -n \
+            --slurpfile files /tmp/atk-files.json \
+            --arg commit "$SHA" --arg repo "$REPO" --arg run_id "$RUN_ID" --arg ref "$REF_NAME" \
+            '{
+               version: 1,
+               source: { repository: $repo, commit: $commit, ref: $ref, run_id: $run_id },
+               files: $files[0]
+             }' > "$out"
+          echo "Wrote manifest with $(jq '.files | length' "$out") files."
+        }
+
+        verify_manifest() {
+          local root="$1" mf="$2" failed=0
+          while IFS=$'\t' read -r expected path; do
+            [ -n "$path" ] || continue
+            if [ ! -f "$root/$path" ]; then
+              echo "::error::Manifest lists '$path' but it was not downloaded."
+              failed=1
+              continue
+            fi
+            actual="$(shasum -a 256 "$root/$path" | cut -d' ' -f1)"
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::Checksum mismatch for '$path' (expected $expected, got $actual)."
+              failed=1
+            fi
+          done < <(jq -r '.files[] | [.sha256, .path] | @tsv' "$mf")
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::Manifest verification failed — the artifact is incomplete or corrupt."
+            exit 1
+          fi
+          echo "Manifest verified: $(jq '.files | length' "$mf") files match."
+        }
+
+        # ── S3 / GCS ─────────────────────────────────────────────────────────────
+        if [ "$backend" = "s3" ] || [ "$backend" = "gcs" ]; then
+          if [ "$backend" = "s3" ]; then
+            sync=(aws s3 sync --no-progress)
+            [ -n "$STORAGE_CLASS" ] && sync+=(--storage-class "$STORAGE_CLASS")
+            for g in $EXCLUDE; do sync+=(--exclude "$g"); done
+            if [ -n "$INCLUDE" ]; then
+              sync+=(--exclude '*')
+              for g in $INCLUDE; do sync+=(--include "$g"); done
+            fi
+            exists_cmd=(aws s3 ls "$REMOTE_URI")
+          else
+            sync=(gcloud storage rsync --recursive)
+            for g in $EXCLUDE; do sync+=(--exclude "$g"); done
+            [ -n "$INCLUDE" ] && echo "::warning::Input 'include' is not supported for gs:// — ignoring."
+            exists_cmd=(gcloud storage ls "$REMOTE_URI")
+          fi
+
+          if [ "$OPERATION" = "upload" ]; then
+            [ -e "$LOCAL_PATH" ] || { echo "::error::local-path '$LOCAL_PATH' does not exist."; exit 1; }
+            if [ "$WRITE_MANIFEST" = "true" ] && [ -d "$LOCAL_PATH" ]; then
+              manifest_file="$LOCAL_PATH/manifest.json"
+              write_manifest "$LOCAL_PATH" "$manifest_file"
+            fi
+            "${sync[@]}" "$LOCAL_PATH" "$REMOTE_URI"
+          else
+            if ! "${exists_cmd[@]}" >/dev/null 2>&1; then
+              if [ "$FAIL_IF_MISSING" = "true" ]; then
+                echo "::error::Nothing at '$REMOTE_URI'."
+                exit 1
+              fi
+              echo "::notice::Nothing at '$REMOTE_URI' — skipping (fail-if-missing is false)."
+              {
+                echo "uri=$REMOTE_URI"; echo "files=0"; echo "bytes=0"
+                echo "manifest_file="; echo "exists=false"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            mkdir -p "$LOCAL_PATH"
+            "${sync[@]}" "$REMOTE_URI" "$LOCAL_PATH"
+            if [ "$WRITE_MANIFEST" = "true" ] && [ -f "$LOCAL_PATH/manifest.json" ]; then
+              manifest_file="$LOCAL_PATH/manifest.json"
+              verify_manifest "$LOCAL_PATH" "$manifest_file"
+            fi
+          fi
+
+        # ── Hugging Face Hub ─────────────────────────────────────────────────────
+        else
+          python3 -m pip install --quiet --upgrade 'huggingface_hub[cli]'
+
+          # hf://owner/repo@revision
+          spec="${REMOTE_URI#hf://}"
+          repo_id="${spec%%@*}"
+          revision=''
+          [ "$spec" != "$repo_id" ] && revision="${spec#*@}"
+
+          if [ -z "$HF_TOKEN" ] && [ "$OPERATION" = "upload" ]; then
+            echo "::error::hf-token is required to upload to the Hugging Face Hub."
+            exit 1
+          fi
+          [ -n "$HF_TOKEN" ] && export HF_TOKEN
+
+          common=(--repo-type "$HF_REPO_TYPE")
+          [ -n "$revision" ] && common+=(--revision "$revision")
+
+          if [ "$OPERATION" = "upload" ]; then
+            [ -e "$LOCAL_PATH" ] || { echo "::error::local-path '$LOCAL_PATH' does not exist."; exit 1; }
+            if [ "$WRITE_MANIFEST" = "true" ] && [ -d "$LOCAL_PATH" ]; then
+              manifest_file="$LOCAL_PATH/manifest.json"
+              write_manifest "$LOCAL_PATH" "$manifest_file"
+            fi
+            args=(upload "$repo_id" "$LOCAL_PATH" . "${common[@]}")
+            args+=(--commit-message "${COMMIT_MESSAGE:-Upload from ${REPO}@${SHA:0:7} (run ${RUN_ID})}")
+            for g in $EXCLUDE; do args+=(--exclude "$g"); done
+            for g in $INCLUDE; do args+=(--include "$g"); done
+            hf "${args[@]}"
+          else
+            args=(download "$repo_id" "${common[@]}" --local-dir "$LOCAL_PATH")
+            for g in $EXCLUDE; do args+=(--exclude "$g"); done
+            for g in $INCLUDE; do args+=(--include "$g"); done
+            if ! hf "${args[@]}"; then
+              if [ "$FAIL_IF_MISSING" = "true" ]; then
+                echo "::error::Failed to download '$repo_id' from the Hugging Face Hub."
+                exit 1
+              fi
+              echo "::notice::Could not download '$repo_id' — skipping (fail-if-missing is false)."
+              {
+                echo "uri=$REMOTE_URI"; echo "files=0"; echo "bytes=0"
+                echo "manifest_file="; echo "exists=false"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [ "$WRITE_MANIFEST" = "true" ] && [ -f "$LOCAL_PATH/manifest.json" ]; then
+              manifest_file="$LOCAL_PATH/manifest.json"
+              verify_manifest "$LOCAL_PATH" "$manifest_file"
+            fi
+          fi
+        fi
+
+        # ── Report ───────────────────────────────────────────────────────────────
+        if [ -d "$LOCAL_PATH" ]; then
+          files="$(find "$LOCAL_PATH" -type f | wc -l | tr -d ' ')"
+          # `du -sb` reads sizes from metadata; summing file contents would mean reading
+          # every byte of a multi-gigabyte checkpoint just to report on it.
+          bytes="$(du -sb "$LOCAL_PATH" | cut -f1)"
+        else
+          files=1
+          bytes="$(wc -c < "$LOCAL_PATH" | tr -d ' ')"
+        fi
+
+        {
+          echo "uri=$REMOTE_URI"
+          echo "files=$files"
+          echo "bytes=$bytes"
+          echo "manifest_file=$manifest_file"
+          echo "exists=$exists"
+        } >> "$GITHUB_OUTPUT"
+
+        {
+          echo "### 📦 ML artifact — ${OPERATION}"
+          echo
+          echo "| | |"
+          echo "|---|---|"
+          echo "| Remote | \`${REMOTE_URI}\` |"
+          echo "| Local | \`${LOCAL_PATH}\` |"
+          echo "| Files | ${files} |"
+          echo "| Size | $(numfmt --to=iec-i --suffix=B "$bytes" 2>/dev/null || echo "${bytes} B") |"
+        } >> "$GITHUB_STEP_SUMMARY"
