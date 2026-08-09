@@ -29,7 +29,10 @@ inputs:
     required: false
     default: ''
   secrets-json:
-    description: '`${{ toJSON(secrets) }}` from the calling workflow.'
+    # Deliberately does not spell the expression out. GitHub evaluates `${{ }}` anywhere in
+    # a manifest — descriptions included — and the `secrets` context does not exist inside
+    # a composite action, so writing it here fails the action at load time.
+    description: 'The toJSON(secrets) expression, passed in from the calling workflow.'
     required: false
     default: '{}'
   mask-literals:

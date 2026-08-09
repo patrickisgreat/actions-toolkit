@@ -146,7 +146,7 @@ executed) and references actions through that path:
 - uses: actions/checkout@v7
   with:
     repository: patrickisgreat/actions-toolkit
-    ref: ${{ github.job_workflow_sha || 'main' }}
+    ref: ${{ github.job_workflow_sha || github.sha }}
     path: .toolkit
 - uses: ./.toolkit/actions/setup-node
 ```

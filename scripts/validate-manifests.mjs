@@ -136,6 +136,46 @@ for (const dir of listDirs(ACTIONS_DIR)) {
     continue;
   }
 
+  // `manifest-expressions`: GitHub evaluates `${{ }}` ANYWHERE in an action manifest,
+  // including inside a `description:`. Two ways that bites:
+  //   • The `secrets` context does not exist in a composite action, so merely *mentioning*
+  //     `${{ toJSON(secrets) }}` in a description fails the action at load time with
+  //     "Unrecognized named-value: 'secrets'" — for every consumer, not just here.
+  //   • A description is documentation; an expression in one is never intentional.
+  // There is no escape sequence for `${{`, so the fix is always to reword the prose.
+  {
+    const source = readFileSync(file, 'utf8');
+    for (const [i, line] of source.split('\n').entries()) {
+      const expressions = line.match(/\$\{\{([^}]*)\}\}/g);
+      if (!expressions) continue;
+
+      const isDescription = /^\s*description:/.test(line);
+      const isComment = /^\s*#/.test(line);
+      if (isComment) continue;
+
+      if (isDescription) {
+        fail(
+          file,
+          'manifest-expressions',
+          `Line ${i + 1}: a 'description:' contains ${expressions[0].trim()}. GitHub evaluates ` +
+            `expressions in descriptions too — reword the prose instead.`,
+        );
+      }
+      for (const expression of expressions) {
+        // Only the bare `secrets` context is illegal. An input legitimately *named*
+        // secrets — `inputs.secrets`, `inputs.secrets-json` — is a property access and fine.
+        if (/(^|[^.\w-])secrets(?![\w-])/.test(expression)) {
+          fail(
+            file,
+            'manifest-expressions',
+            `Line ${i + 1}: ${expression.trim()} references the 'secrets' context, which does ` +
+              `not exist inside a composite action. Take the value as an input instead.`,
+          );
+        }
+      }
+    }
+  }
+
   if (!doc?.name) fail(file, 'documented', "Missing top-level 'name'.");
   if (!doc?.description) fail(file, 'documented', "Missing top-level 'description'.");
   if (doc?.runs?.using !== 'composite') {
@@ -251,7 +291,7 @@ for (const file of listYaml(WORKFLOWS_DIR)) {
         file,
         'toolkit-checkout',
         `Job '${jobName}' pins the .toolkit checkout to '${ref}'. It must use ` +
-          `\${{ github.job_workflow_sha || 'main' }} so actions match the workflow version the caller pinned.`,
+          `\${{ github.job_workflow_sha || github.sha }} so actions match the workflow version the caller pinned.`,
       );
     }
 

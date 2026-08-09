@@ -197,7 +197,7 @@ Every reusable workflow job starts with:
 - uses: actions/checkout@v7
   with:
     repository: patrickisgreat/actions-toolkit
-    ref: ${{ github.job_workflow_sha || 'main' }}
+    ref: ${{ github.job_workflow_sha || github.sha }}
     path: .toolkit
 ```
 
@@ -210,6 +210,12 @@ relative path. The toolkit has to clone itself.
 **Why the ref is `github.job_workflow_sha`.** That's the commit SHA of the reusable workflow
 file currently executing. Pin `@v1.4.0` and the actions it runs are v1.4.0's actions. A
 workflow can never drift from the actions it calls.
+
+**Why there's a `|| github.sha` fallback.** `job_workflow_sha` is populated when the
+workflow is called from another repo — your case. It comes back empty when a workflow is
+called *locally* within the toolkit repo, which is how this repo's own CI exercises them;
+there, `github.sha` is the commit under test and is the correct ref. You should never see
+the fallback used.
 
 Consequences for you:
 
