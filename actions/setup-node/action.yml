@@ -71,6 +71,7 @@ runs:
         REQUESTED: ${{ inputs.package-manager }}
         FROZEN: ${{ inputs.frozen-lockfile }}
         ACTOR: ${{ github.actor }}
+        IN_PNPM_VERSION: ${{ inputs.pnpm-version }}
       run: |
         set -euo pipefail
 
@@ -111,6 +112,19 @@ runs:
           *)   cache_key="$manager" ;;
         esac
 
+        # pnpm/action-setup resolves its version from `packageManager` in a package.json,
+        # and it looks at the REPOSITORY ROOT by default — not at our working-directory.
+        # For a project in a subdirectory that means it finds nothing and fails with the
+        # unhelpful "No pnpm version is specified". Point it at the right file, and fail
+        # here with an actionable message when neither source can supply a version.
+        if [ "$manager" = "pnpm" ] && [ -z "${IN_PNPM_VERSION:-}" ]; then
+          if ! grep -q '"packageManager"[[:space:]]*:' package.json 2>/dev/null; then
+            echo "::error::pnpm was detected but no version is available. Add a \"packageManager\": \"pnpm@x.y.z\" field to $PWD/package.json, or set the pnpm-version input."
+            exit 1
+          fi
+          echo "Using the pnpm version from $PWD/package.json."
+        fi
+
         {
           echo "manager=$manager"
           echo "frozen=$frozen"
@@ -123,6 +137,9 @@ runs:
       uses: pnpm/action-setup@v6.0.10
       with:
         version: ${{ inputs.pnpm-version }}
+        # Without this it reads the repo-root package.json, which in a monorepo is the
+        # wrong file and usually has no `packageManager` field at all.
+        package_json_file: ${{ inputs.working-directory }}/package.json
 
     - name: Set up Bun
       if: steps.detect.outputs.manager == 'bun'

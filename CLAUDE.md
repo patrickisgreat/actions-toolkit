@@ -25,10 +25,10 @@ therefore starts each job with:
 
 ```yaml
 - name: Check out the toolkit
-  uses: actions/checkout@v4
+  uses: actions/checkout@v7
   with:
     repository: patrickisgreat/actions-toolkit
-    ref: ${{ github.job_workflow_sha || 'main' }}
+    ref: ${{ github.job_workflow_sha || github.sha }}
     path: .toolkit
 - uses: ./.toolkit/actions/setup-node
 ```
@@ -127,7 +127,10 @@ Full detail in [docs/AUTHORING.md](docs/AUTHORING.md). The essentials:
   guards with `github.event.pull_request.head.repo.full_name == github.repository`.
 - Dependabot-triggered runs use the *Dependabot* secret store, not Actions secrets — an
   AI-review or deploy job will see empty strings. Skip `github.actor == 'dependabot[bot]'`.
-- `github.job_workflow_sha` is only populated for reusable-workflow jobs. In this repo's
-  own non-reusable workflows it is empty, hence the `|| 'main'` fallback.
+- `github.job_workflow_sha` is populated when a workflow is called from *another* repo, but
+  observed empty when a workflow in this repo is called locally (`uses: ./.github/...`),
+  which is how self-CI exercises them. Hence `|| github.sha`: locally that is the commit
+  under test, which is exactly right. An earlier `|| 'main'` fallback silently checked out
+  the wrong tree and produced "Can't find action.yml under .toolkit/…".
 - OIDC (`id-token: write`) is the default cloud auth path here. Long-lived keys are
   supported but every action that accepts them emits a `::warning::`.

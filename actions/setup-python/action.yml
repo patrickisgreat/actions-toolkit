@@ -65,7 +65,9 @@ runs:
   steps:
     - name: Set up uv
       if: inputs.installer == 'uv'
-      uses: astral-sh/setup-uv@v9
+      # Pinned to an exact patch: astral-sh/setup-uv stopped publishing moving major tags
+      # after v7.6, so `@v9` does not resolve. Dependabot bumps this.
+      uses: astral-sh/setup-uv@v9.0.0
       with:
         version: ${{ inputs.uv-version }}
         enable-cache: ${{ inputs.cache }}

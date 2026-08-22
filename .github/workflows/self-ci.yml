@@ -86,11 +86,25 @@ jobs:
           set -euo pipefail
           node scripts/gen-docs.mjs --check
 
+      - name: Check that every action ref resolves
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # No linter talks to GitHub, so a pin to a tag that does not exist is invisible
+          # until the step runs — potentially in a consumer's deploy pipeline.
+          ./scripts/check-action-refs.sh
+
   commitlint:
     name: Commit messages
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      # The action lists the PR's commits through the API; without this it fails with
+      # "Resource not accessible by integration" before it lints anything.
+      pull-requests: read
     steps:
       - uses: actions/checkout@v7
         with:
@@ -106,6 +120,11 @@ jobs:
     name: Execute actions
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      # pr-comment is exercised for real against this PR — create, find, delete. There is
+      # no way to test it without the permission it exists to use.
+      pull-requests: write
     steps:
       - uses: actions/checkout@v7
         with:
@@ -180,12 +199,38 @@ jobs:
           text: Rendered by the `notify` action with no webhooks configured.
           fields: '{"Suite":"self-ci","Runner":"ubuntu-latest"}'
 
-      - name: pr-comment — no-op outside a PR
+      - name: pr-comment — create
         id: comment
         uses: ./actions/pr-comment
         with:
           marker: self-ci-smoke
-          body: This should be skipped on a push, and posted on a pull request.
+          body: |
+            Transient self-CI check of the `pr-comment` action. Deleted moments later by
+            the same job — if you are reading this, the cleanup step did not run.
+
+      - name: Assert pr-comment
+        env:
+          COMMENT_ID: ${{ steps.comment.outputs.comment-id }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # On a PR the action must find the number from the payload and return an id.
+            [ -n "$COMMENT_ID" ] || { echo "::error::pr-comment returned no comment id on a pull_request event."; exit 1; }
+            echo "pr-comment created comment $COMMENT_ID"
+          else
+            # On a push there is no PR to comment on; the action must skip, not fail.
+            [ -z "$COMMENT_ID" ] || { echo "::error::pr-comment should be a no-op off a pull request, but returned '$COMMENT_ID'."; exit 1; }
+            echo "pr-comment correctly skipped outside a pull request"
+          fi
+
+      - name: pr-comment — delete
+        # `always()` so a failed assertion above still cleans the comment up.
+        if: ${{ always() }}
+        uses: ./actions/pr-comment
+        with:
+          marker: self-ci-smoke
+          mode: delete
 
       - name: setup-terraform — resolve the version and run fmt
         id: setup-tf
