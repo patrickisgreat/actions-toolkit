@@ -7,12 +7,13 @@
 paths:
   .github/workflows/**/*.yml:
     ignore:
-      # `github.job_workflow_sha` is a documented context property (the commit SHA of the
-      # reusable workflow file currently executing). actionlint's built-in `github` context
-      # type predates it, so every `.toolkit` checkout — the mechanism the whole repo is
-      # built on, see CLAUDE.md — trips this. Track:
-      # https://docs.github.com/actions/reference/contexts-reference#github-context
-      - 'property "job_workflow_sha" is not defined'
+      # `job.workflow_sha` is the commit SHA of the reusable workflow file currently
+      # executing — GitHub added the `job` context on 2026-04-23. actionlint 1.7.12 knows
+      # `job.workflow_ref` and `job.workflow_repository` but not `job.workflow_sha`, so
+      # every `.toolkit` checkout — the mechanism the whole repo is built on, see CLAUDE.md
+      # — trips this. Drop the ignore once actionlint catches up. Track:
+      # https://docs.github.com/actions/reference/workflows-and-actions/contexts#job-context
+      - 'property "workflow_sha" is not defined'
 
       # Reusable workflows here take credentials as optional `secrets:` and pass them
       # straight through to an action. actionlint can't know a caller will supply them.

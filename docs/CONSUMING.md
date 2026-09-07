@@ -197,7 +197,7 @@ Every reusable workflow job starts with:
 - uses: actions/checkout@v7
   with:
     repository: patrickisgreat/actions-toolkit
-    ref: ${{ github.job_workflow_sha || github.sha }}
+    ref: ${{ job.workflow_sha }}
     path: .toolkit
 ```
 
@@ -207,15 +207,16 @@ You never write this, but you'll see it in logs and it explains two things.
 *caller's* checkout, so a reusable workflow cannot reference its own repo's actions by
 relative path. The toolkit has to clone itself.
 
-**Why the ref is `github.job_workflow_sha`.** That's the commit SHA of the reusable workflow
-file currently executing. Pin `@v1.4.0` and the actions it runs are v1.4.0's actions. A
-workflow can never drift from the actions it calls.
+**Why the ref is `job.workflow_sha`.** That's the commit SHA of the reusable workflow file
+currently executing. Pin `@v1.4.0` and the actions it runs are v1.4.0's actions. A workflow
+can never drift from the actions it calls.
 
-**Why there's a `|| github.sha` fallback.** `job_workflow_sha` is populated when the
-workflow is called from another repo — your case. It comes back empty when a workflow is
-called *locally* within the toolkit repo, which is how this repo's own CI exercises them;
-there, `github.sha` is the commit under test and is the correct ref. You should never see
-the fallback used.
+**Why it is not `github.job_workflow_sha`.** That property is documented, but has never
+been populated in a reusable workflow — see actions/runner#2417. GitHub added the `job`
+context in April 2026 to give this a working home. Toolkit versions before v1 used
+`${{ github.job_workflow_sha || github.sha }}`, which always fell through to the caller's
+commit and failed in any consumer repo with `upload-pack: not our ref`. If you see that
+error, you are on an old ref of the toolkit.
 
 Consequences for you:
 

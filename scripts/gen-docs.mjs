@@ -223,7 +223,7 @@ Every workflow here is called with \`uses:\`, not copied. Pin to \`@${PIN}\` for
 major, or to an exact release for a frozen pipeline — see
 [VERSIONING.md](VERSIONING.md).
 
-Each one checks this repo out at \`github.job_workflow_sha\` so the composite actions it runs
+Each one checks this repo out at \`job.workflow_sha\` so the composite actions it runs
 always match the workflow version you pinned. You do not need to do anything for that to
 work; it is explained in [CONSUMING.md](CONSUMING.md).
 

@@ -139,14 +139,14 @@ drop down to the pieces when your needs diverge — without a rewrite.
 
 A reusable workflow cannot use `./actions/...` — inside a workflow called from another repo,
 `./` resolves to the **caller's** checkout. So every reusable workflow here checks this
-repository out at `github.job_workflow_sha` (the commit SHA of the workflow file being
-executed) and references actions through that path:
+repository out at `job.workflow_sha` (the commit SHA of the workflow file being executed)
+and references actions through that path:
 
 ```yaml
 - uses: actions/checkout@v7
   with:
     repository: patrickisgreat/actions-toolkit
-    ref: ${{ github.job_workflow_sha || github.sha }}
+    ref: ${{ job.workflow_sha }}
     path: .toolkit
 - uses: ./.toolkit/actions/setup-node
 ```

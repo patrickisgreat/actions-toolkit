@@ -17,8 +17,8 @@
 #
 # 1. `.toolkit` checkout. A reusable workflow cannot `uses: ./actions/…` — inside a called
 #    workflow `./` is the *caller's* checkout. Each job therefore clones this repo at
-#    `github.job_workflow_sha`, the SHA of this very workflow file, so the actions always
-#    match the workflow version the caller pinned.
+#    `job.workflow_sha`, the SHA of this very workflow file, so the actions always match
+#    the workflow version the caller pinned.
 #
 # 2. The format gate runs the formatter and fails if it changed anything, rather than
 #    running `--check`. Same signal, but the job log then names the offending files.
@@ -184,7 +184,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: patrickisgreat/actions-toolkit
-          ref: ${{ github.job_workflow_sha || github.sha }}
+          ref: ${{ job.workflow_sha }}
           path: .toolkit
 
       - name: Set up Node
@@ -252,7 +252,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: patrickisgreat/actions-toolkit
-          ref: ${{ github.job_workflow_sha || github.sha }}
+          ref: ${{ job.workflow_sha }}
           path: .toolkit
 
       - name: Set up Node
@@ -308,7 +308,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: patrickisgreat/actions-toolkit
-          ref: ${{ github.job_workflow_sha || github.sha }}
+          ref: ${{ job.workflow_sha }}
           path: .toolkit
 
       - name: Set up Node
@@ -359,7 +359,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: patrickisgreat/actions-toolkit
-          ref: ${{ github.job_workflow_sha || github.sha }}
+          ref: ${{ job.workflow_sha }}
           path: .toolkit
 
       - name: Decide the test scope

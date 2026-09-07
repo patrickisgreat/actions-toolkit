@@ -286,12 +286,24 @@ for (const file of listYaml(WORKFLOWS_DIR)) {
       );
     }
     const ref = String(checkoutStep.with?.ref ?? '');
-    if (!ref.includes('github.job_workflow_sha')) {
+    // `github.job_workflow_sha` is documented but has never been populated in a reusable
+    // workflow (actions/runner#2417), so any expression falling back off it silently
+    // resolved to the *caller's* commit — fine inside this repo, fatal in every consumer
+    // ("upload-pack: not our ref"). Self-CI cannot catch that, because the fallback is only
+    // wrong when the caller is a different repo. This rule is the guard instead.
+    if (ref.includes('github.job_workflow_sha')) {
+      fail(
+        file,
+        'toolkit-checkout',
+        `Job '${jobName}' pins the .toolkit checkout to '${ref}'. ` +
+          `github.job_workflow_sha is never populated — use \${{ job.workflow_sha }}.`,
+      );
+    } else if (!ref.includes('job.workflow_sha')) {
       fail(
         file,
         'toolkit-checkout',
         `Job '${jobName}' pins the .toolkit checkout to '${ref}'. It must use ` +
-          `\${{ github.job_workflow_sha || github.sha }} so actions match the workflow version the caller pinned.`,
+          `\${{ job.workflow_sha }} so actions match the workflow version the caller pinned.`,
       );
     }
 

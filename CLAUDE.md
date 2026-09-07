@@ -28,15 +28,19 @@ therefore starts each job with:
   uses: actions/checkout@v7
   with:
     repository: patrickisgreat/actions-toolkit
-    ref: ${{ github.job_workflow_sha || github.sha }}
+    ref: ${{ job.workflow_sha }}
     path: .toolkit
 - uses: ./.toolkit/actions/setup-node
 ```
 
-`github.job_workflow_sha` is the commit SHA of *the reusable workflow file being executed*.
-Using it means the composite actions a workflow runs are always the exact ones from the
-same commit as the workflow — a caller pinned to `@v1.4.0` gets v1.4.0 actions, and this
-repo's own CI tests HEAD against HEAD. Never hardcode a tag there.
+`job.workflow_sha` is the commit SHA of *the reusable workflow file being executed*. Using
+it means the composite actions a workflow runs are always the exact ones from the same
+commit as the workflow — a caller pinned to `@v1.4.0` gets v1.4.0 actions, and this repo's
+own CI tests HEAD against HEAD. Never hardcode a tag there.
+
+It is `job.workflow_sha`, not `github.job_workflow_sha`. The latter is documented but has
+never actually been populated (actions/runner#2417); GitHub shipped the `job` context in
+April 2026 to fix that. See the gotchas at the bottom of this file.
 
 This is encoded once in the boilerplate at the top of every reusable workflow. Copy it
 verbatim when adding a new one; `scripts/validate-manifests.mjs` fails the build if a
@@ -127,10 +131,15 @@ Full detail in [docs/AUTHORING.md](docs/AUTHORING.md). The essentials:
   guards with `github.event.pull_request.head.repo.full_name == github.repository`.
 - Dependabot-triggered runs use the *Dependabot* secret store, not Actions secrets — an
   AI-review or deploy job will see empty strings. Skip `github.actor == 'dependabot[bot]'`.
-- `github.job_workflow_sha` is populated when a workflow is called from *another* repo, but
-  observed empty when a workflow in this repo is called locally (`uses: ./.github/...`),
-  which is how self-CI exercises them. Hence `|| github.sha`: locally that is the commit
-  under test, which is exactly right. An earlier `|| 'main'` fallback silently checked out
-  the wrong tree and produced "Can't find action.yml under .toolkit/…".
+- **Use `job.workflow_sha`, never `github.job_workflow_sha`.** The `github.` one is
+  documented but has never been populated in a reusable workflow — a runner bug open since
+  2023 (actions/runner#2417). GitHub added the `job` context on 2026-04-23 specifically to
+  fix it. We shipped `${{ github.job_workflow_sha || github.sha }}` for a while, which meant
+  the fallback was taken *every* time: inside this repo `github.sha` is a valid ref so
+  self-CI passed, while every consumer repo died with `upload-pack: not our ref <their sha>`.
+  Self-CI could not catch it, because the fallback is only wrong when the caller is a
+  different repo. See the `consumer-checkout` job, which now asserts the ref resolves.
+- actionlint 1.7.12 does not know `job.workflow_sha` yet, so `.github/actionlint.yaml`
+  ignores that one property. Everything else it flags gets fixed, not ignored.
 - OIDC (`id-token: write`) is the default cloud auth path here. Long-lived keys are
   supported but every action that accepts them emits a `::warning::`.

@@ -264,8 +264,13 @@ jobs:
           echo "setup-python OK"
 
   # ── Call the reusable workflows for real ─────────────────────────────────────────────
-  # This is the only way to prove the `.toolkit` checkout mechanism works: the job resolves
-  # `github.job_workflow_sha` and clones this repo at it, exactly as a consumer would.
+  # These call the reusable workflows for real, which exercises the `.toolkit` checkout.
+  #
+  # ⚠️ They are NOT equivalent to a consumer calling them. Here the caller and the toolkit
+  # are the same repo, so any ref that resolves to a commit in *this* repo works — which is
+  # exactly how `github.job_workflow_sha || github.sha` passed here for months while failing
+  # in every consumer. The real guard is the `toolkit-checkout` rule in
+  # scripts/validate-manifests.mjs; treat these jobs as smoke, not proof.
   consume-node-ci:
     name: Consume node-ci
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
