@@ -6,7 +6,7 @@ Every workflow here is called with `uses:`, not copied. Pin to `@v1` for the mov
 major, or to an exact release for a frozen pipeline — see
 [VERSIONING.md](VERSIONING.md).
 
-Each one checks this repo out at `github.job_workflow_sha` so the composite actions it runs
+Each one checks this repo out at `job.workflow_sha` so the composite actions it runs
 always match the workflow version you pinned. You do not need to do anything for that to
 work; it is explained in [CONSUMING.md](CONSUMING.md).
 
@@ -1017,8 +1017,8 @@ Usage:
 
 1. `.toolkit` checkout. A reusable workflow cannot `uses: ./actions/…` — inside a called
    workflow `./` is the *caller's* checkout. Each job therefore clones this repo at
-   `github.job_workflow_sha`, the SHA of this very workflow file, so the actions always
-   match the workflow version the caller pinned.
+   `job.workflow_sha`, the SHA of this very workflow file, so the actions always match
+   the workflow version the caller pinned.
 
 2. The format gate runs the formatter and fails if it changed anything, rather than
    running `--check`. Same signal, but the job log then names the offending files.

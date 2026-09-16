@@ -81,7 +81,7 @@ and let the workflow wire them.
 
 *Rule: `no-local-action-refs`.*
 
-### 4. Reusable workflows check the toolkit out at `job_workflow_sha`
+### 4. Reusable workflows check the toolkit out at `job.workflow_sha`
 
 Inside a called workflow `./` is the **caller's** checkout. Every job that uses a toolkit
 action needs this first, verbatim:
@@ -90,14 +90,19 @@ action needs this first, verbatim:
 - uses: actions/checkout@v7
   with:
     repository: patrickisgreat/actions-toolkit
-    ref: ${{ github.job_workflow_sha || github.sha }}
+    ref: ${{ job.workflow_sha }}
     path: .toolkit
 
 - uses: ./.toolkit/actions/setup-node
 ```
 
-Never hardcode a tag in that `ref`. `job_workflow_sha` is the SHA of the workflow file
+Never hardcode a tag in that `ref`. `job.workflow_sha` is the SHA of the workflow file
 being executed, which is what keeps actions and workflow at the same version.
+
+It is `job.workflow_sha`, not `github.job_workflow_sha` — the latter is documented but has
+never been populated (actions/runner#2417), so anything falling back off it resolves to the
+caller's commit and dies with `upload-pack: not our ref` in every consumer repo. The
+`toolkit-checkout` rule in `scripts/validate-manifests.mjs` rejects it.
 
 *Rules: `toolkit-checkout`.*
 
