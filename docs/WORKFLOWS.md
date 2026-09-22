@@ -1381,6 +1381,12 @@ Usage:
 | `docs-directories` | `string` | no | `modules` | Root searched for modules needing docs (each dir with a `versions.tf`). |
 | `timeout-minutes` | `number` | no | `15` | Per-job timeout. |
 
+### Secrets
+
+| Secret | Required | Description |
+|---|---|---|
+| `MODULES_SSH_KEY` | no | Read-only deploy key for private module sources written as `git::ssh://...`. Only the validate job receives it. Omit when every module is public or local. |
+
 ### Outputs
 
 _No outputs._

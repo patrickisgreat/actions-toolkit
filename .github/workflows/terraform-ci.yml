@@ -98,6 +98,13 @@ on:
         required: false
         default: 15
 
+    secrets:
+      MODULES_SSH_KEY:
+        description: |
+          Read-only deploy key for private module sources written as `git::ssh://...`.
+          Only the validate job receives it. Omit when every module is public or local.
+        required: false
+
 permissions:
   contents: read
 
@@ -201,6 +208,9 @@ jobs:
       max-parallel: 8
       matrix:
         directory: ${{ fromJSON(needs.discover.outputs.directories) }}
+    env:
+      # `secrets` cannot appear in a step `if`, so the presence check is bound here.
+      HAS_MODULES_SSH_KEY: ${{ secrets.MODULES_SSH_KEY != '' }}
     steps:
       - uses: actions/checkout@v7
 
@@ -216,6 +226,12 @@ jobs:
         with:
           binary: ${{ inputs.binary }}
           version: ${{ inputs.version }}
+
+      - name: Authenticate private module sources
+        if: ${{ env.HAS_MODULES_SSH_KEY == 'true' }}
+        uses: ./.toolkit/actions/git-ssh-auth
+        with:
+          ssh-private-key: ${{ secrets.MODULES_SSH_KEY }}
 
       - name: Init and validate
         working-directory: ${{ matrix.directory }}

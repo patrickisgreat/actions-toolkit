@@ -249,6 +249,52 @@ jobs:
           tflint --version
           echo "setup-terraform OK"
 
+      - name: git-ssh-auth — make a throwaway key
+        id: throwaway-key
+        run: |
+          set -euo pipefail
+          ssh-keygen -q -t ed25519 -N '' -C self-ci -f "$RUNNER_TEMP/throwaway"
+          {
+            echo 'key<<EOF_KEY'
+            cat "$RUNNER_TEMP/throwaway"
+            echo 'EOF_KEY'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: git-ssh-auth — configure
+        id: ssh-auth
+        uses: ./actions/git-ssh-auth
+        with:
+          ssh-private-key: ${{ steps.throwaway-key.outputs.key }}
+
+      - name: Assert git-ssh-auth
+        env:
+          KEY_PATH: ${{ steps.ssh-auth.outputs.key-path }}
+        run: |
+          set -euo pipefail
+          [ "$(stat -c %a "$KEY_PATH")" = "600" ] || { echo "::error::key file must be 0600"; exit 1; }
+          case "$GIT_SSH_COMMAND" in
+            *"StrictHostKeyChecking=yes"*) ;;
+            *) echo "::error::GIT_SSH_COMMAND must pin host keys, got '$GIT_SSH_COMMAND'"; exit 1 ;;
+          esac
+          hosts="$(dirname "$KEY_PATH")/known_hosts"
+          grep -q '^github.com ssh-ed25519 ' "$hosts" || { echo "::error::github.com ed25519 host key not pinned"; exit 1; }
+          echo "git-ssh-auth OK"
+
+      - name: git-ssh-auth — an empty key must fail
+        id: ssh-auth-empty
+        continue-on-error: true
+        uses: ./actions/git-ssh-auth
+        with:
+          ssh-private-key: ''
+
+      - name: Assert git-ssh-auth refuses an empty key
+        env:
+          OUTCOME: ${{ steps.ssh-auth-empty.outcome }}
+        run: |
+          set -euo pipefail
+          [ "$OUTCOME" = "failure" ] || { echo "::error::an empty key must fail, got '$OUTCOME'"; exit 1; }
+          echo "git-ssh-auth correctly refused an empty key"
+
       - name: setup-python — uv install in a fixture project
         id: setup-py
         uses: ./actions/setup-python
