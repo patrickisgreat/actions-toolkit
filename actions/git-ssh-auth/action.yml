@@ -1,0 +1,75 @@
+# Let git (and anything that shells out to it, like `terraform init`) clone private repos
+# over SSH, e.g. Terraform module sources written as `git::ssh://git@github.com/org/repo`.
+#
+# No agent daemon: the key is written to $RUNNER_TEMP with 0600 permissions and git is
+# pointed at it through GIT_SSH_COMMAND for the rest of the job. $RUNNER_TEMP is wiped at
+# the end of every job on GitHub-hosted runners. On self-hosted runners, delete it yourself.
+#
+# Host keys are never accepted on first use. By default GitHub's keys are fetched from
+# api.github.com/meta, over TLS, and pinned in a job-local known_hosts file.
+#
+# Use a read-only deploy key scoped to the one repo it needs, not a personal key.
+
+name: Git SSH auth
+description: Configure git to clone private repositories over SSH with a deploy key
+
+inputs:
+  ssh-private-key:
+    description: OpenSSH private key (a read-only deploy key). Pass it from a secret.
+    required: true
+  known-hosts:
+    description: |
+      known_hosts lines to trust. Empty fetches github.com's published host keys from
+      api.github.com/meta, which is what you want for GitHub-hosted repos.
+    required: false
+    default: ''
+
+outputs:
+  key-path:
+    description: Path of the private key file written for this job.
+    value: ${{ steps.configure.outputs.key_path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Configure git SSH
+      id: configure
+      shell: bash
+      env:
+        SSH_PRIVATE_KEY: ${{ inputs.ssh-private-key }}
+        KNOWN_HOSTS: ${{ inputs.known-hosts }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "$SSH_PRIVATE_KEY" ]; then
+          echo "::error::ssh-private-key is empty. Pass a deploy key from a secret, e.g. secrets.MODULES_SSH_KEY."
+          exit 1
+        fi
+
+        dir="$RUNNER_TEMP/git-ssh-auth"
+        mkdir -p "$dir"
+        chmod 700 "$dir"
+
+        key="$dir/id"
+        umask 077
+        printf '%s\n' "$SSH_PRIVATE_KEY" > "$key"
+        if ! ssh-keygen -y -f "$key" > /dev/null 2>&1; then
+          echo "::error::ssh-private-key is not a valid unencrypted OpenSSH private key."
+          exit 1
+        fi
+
+        hosts="$dir/known_hosts"
+        if [ -n "$KNOWN_HOSTS" ]; then
+          printf '%s\n' "$KNOWN_HOSTS" > "$hosts"
+        else
+          curl -fsSL https://api.github.com/meta \
+            | jq -r '.ssh_keys[] | "github.com " + .' > "$hosts"
+        fi
+        if [ ! -s "$hosts" ]; then
+          echo "::error::No known_hosts entries; refusing to trust an unknown host key."
+          exit 1
+        fi
+
+        echo "GIT_SSH_COMMAND=ssh -i $key -o IdentitiesOnly=yes -o UserKnownHostsFile=$hosts -o StrictHostKeyChecking=yes" >> "$GITHUB_ENV"
+        echo "key_path=$key" >> "$GITHUB_OUTPUT"
+        echo "git SSH configured with $(wc -l < "$hosts") pinned host key(s)."

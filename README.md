@@ -120,6 +120,7 @@ drop down to the pieces when your needs diverge — without a rewrite.
 | [`deploy-vercel`](actions/deploy-vercel/) | Build and deploy a project to Vercel (preview or production) via the Vercel CLI |
 | [`docker-build-push`](actions/docker-build-push/) | Build, tag, cache, and push a container image to any registry |
 | [`gcp-auth`](actions/gcp-auth/) | Authenticate to Google Cloud via Workload Identity Federation or an SA key |
+| [`git-ssh-auth`](actions/git-ssh-auth/) | Configure git to clone private repositories over SSH with a deploy key |
 | [`llm-call`](actions/llm-call/) | Send a prompt to OpenRouter, Anthropic, OpenAI, Gemini, or any OpenAI-compatible API |
 | [`llm-eval`](actions/llm-eval/) | Run a promptfoo (or custom) LLM eval suite and gate on pass rate and cost |
 | [`ml-artifact`](actions/ml-artifact/) | Upload or download model/dataset artifacts to S3, GCS, or the Hugging Face Hub |
