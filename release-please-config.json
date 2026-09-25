@@ -6,7 +6,6 @@
   "separate-pull-requests": false,
   "packages": {
     ".": {
-      "package-name": "actions-toolkit",
       "changelog-path": "CHANGELOG.md"
     }
   },
