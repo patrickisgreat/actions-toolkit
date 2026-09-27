@@ -134,7 +134,7 @@ runs:
     # pnpm must be on PATH before setup-node runs, or setup-node's pnpm cache lookup fails.
     - name: Set up pnpm
       if: steps.detect.outputs.manager == 'pnpm'
-      uses: pnpm/action-setup@v6.0.10
+      uses: pnpm/action-setup@v6.1.0
       with:
         version: ${{ inputs.pnpm-version }}
         # Without this it reads the repo-root package.json, which in a monorepo is the
