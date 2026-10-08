@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.0](https://github.com/patrickisgreat/actions-toolkit/compare/v0.2.0...v1.0.0) (2026-10-08)
+
+
+### Bug Fixes
+
+* **ci:** drop the release-please package-name so merged release PRs actually cut a release ([a11108d](https://github.com/patrickisgreat/actions-toolkit/commit/a11108d1407bc91441050a579a0a4652f098dffc))
+
 ## [0.2.0](https://github.com/patrickisgreat/actions-toolkit/compare/v0.1.0...v0.2.0) (2026-09-25)
 
 
